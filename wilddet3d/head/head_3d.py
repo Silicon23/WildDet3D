@@ -73,6 +73,8 @@ class Det3DHead(nn.Module):
         depth_latent_dim: int | None = None,
         use_camera_prompt: bool = True,
         use_depth_prompt: bool = True,
+        use_temporal_prompt: bool = False,
+        traj_token_dim: int = 256,
     ) -> None:
         """Initialize the 3D detection head.
 
@@ -80,11 +82,20 @@ class Det3DHead(nn.Module):
             depth_latent_dim: Dimension of depth latents from geometry backend.
                 If provided, uses this directly. If None, computes from
                 depth_output_scales as embed_dims // 2**depth_output_scales.
+            use_temporal_prompt: Track C. Adds a per-layer temporal prompt
+                (cloned Prompt3DQueryLayer) gated by a zero-init LayerScale, and
+                enables the output-space residual on ``temporal_box_12d`` in
+                ``single_forward``. Backward compatible: when False (default) or
+                when temporal inputs are None, the head behaves exactly as the
+                pretrained WildDet3D head.
+            traj_token_dim: Dim of the trajectory-encoder tokens fed to the
+                temporal prompt (256 for Flavor 1).
         """
         super().__init__()
         self.embed_dims = embed_dims
         self.use_camera_prompt = use_camera_prompt
         self.use_depth_prompt = use_depth_prompt
+        self.use_temporal_prompt = use_temporal_prompt
 
         self.num_pred_layer = (
             num_decoder_layer + 1 if as_two_stage else num_decoder_layer
@@ -127,6 +138,29 @@ class Det3DHead(nn.Module):
             self.project_depth = None
             self.prompt_depth = None
 
+        # Temporal prompt branch (Track C). Cloned per prediction layer, gated
+        # by a per-layer zero-init LayerScale so it is identity at init.
+        if self.use_temporal_prompt:
+            project_temporal, prompt_temporal = self._get_condition_branch(
+                input_dims=traj_token_dim, expansion=4, embed_dims=embed_dims
+            )
+            self.project_temporal = get_clones(
+                project_temporal, self.num_pred_layer
+            )
+            self.prompt_temporal = get_clones(
+                prompt_temporal, self.num_pred_layer
+            )
+            self.temporal_gate = nn.ParameterList(
+                [
+                    nn.Parameter(torch.zeros(embed_dims))
+                    for _ in range(self.num_pred_layer)
+                ]
+            )
+        else:
+            self.project_temporal = None
+            self.prompt_temporal = None
+            self.temporal_gate = None
+
         self._init_weights()
 
     def _get_reg_branch(
@@ -168,6 +202,22 @@ class Det3DHead(nn.Module):
         for m in self.conf_branches:
             xavier_init(m, distribution="uniform")
 
+    def zero_init_reg_residual(self) -> None:
+        """Zero-init the final Linear of every reg_branch (Track C).
+
+        Makes the per-layer regression an output-space *residual* on top of the
+        temporal-encoder box: with ``reg_output = reg_branches[i](h) +
+        temporal_box_12d`` and a zero final layer, the head outputs exactly the
+        temporal prior at init and learns image-grounded corrections from there.
+
+        Call this AFTER loading pretrained 3D-head weights (otherwise
+        ``load_state_dict`` overwrites the zeros). The temporal prompt itself is
+        already identity-at-init via its zero ``temporal_gate``.
+        """
+        for m in self.reg_branches:
+            nn.init.zeros_(m[-1].weight)
+            nn.init.zeros_(m[-1].bias)
+
     def get_camera_embeddings(
         self,
         intrinsics: Tensor,
@@ -205,6 +255,8 @@ class Det3DHead(nn.Module):
         hidden_state: Tensor,
         ray_embeddings: Tensor | None,
         depth_latents: Tensor | None = None,
+        temporal_tokens: Tensor | None = None,
+        temporal_box_12d: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Single layer forward pass of the 3D detection head.
 
@@ -213,6 +265,12 @@ class Det3DHead(nn.Module):
             hidden_state: Query hidden states [B, num_queries, embed_dims].
             ray_embeddings: Ray embeddings [B, H*W, 81]. Only used if use_camera_prompt=True.
             depth_latents: Depth latent features [B, H*W, depth_embed_dims].
+            temporal_tokens: Track C trajectory-encoder tokens
+                [B, n_tok, traj_token_dim] (n_tok=1 for Flavor 1). Cross-attended
+                by the per-layer temporal prompt, gated by a zero-init LayerScale.
+            temporal_box_12d: Track C output-space residual base, the temporal
+                box re-encoded to the 12-d coder space against this frame's
+                predicted 2D box. Broadcastable to [B, num_queries, reg_dims].
 
         Returns:
             Tuple of (reg_output, conf_output):
@@ -233,7 +291,22 @@ class Det3DHead(nn.Module):
                 hidden_state, proj_depth_latents, proj_depth_latents
             )
 
+        # Temporal-aware 3D queries (Track C). Zero-init gate -> identity at init.
+        if self.use_temporal_prompt and temporal_tokens is not None:
+            proj_temporal = self.project_temporal[layer_id](temporal_tokens)
+            updated = self.prompt_temporal[layer_id](
+                hidden_state, proj_temporal, proj_temporal
+            )
+            hidden_state = hidden_state + self.temporal_gate[layer_id] * (
+                updated - hidden_state
+            )
+
         reg_output = self.reg_branches[layer_id](hidden_state)
+        # Output-space residual on the temporal prior (Track C). With the final
+        # reg Linear zero-init (see zero_init_reg_residual), reg_output is the
+        # temporal prior at init; otherwise it is a correction on top of it.
+        if temporal_box_12d is not None:
+            reg_output = reg_output + temporal_box_12d
         conf_output = self.conf_branches[layer_id](hidden_state)
 
         return reg_output, conf_output
@@ -243,6 +316,8 @@ class Det3DHead(nn.Module):
         hidden_states: Tensor,
         ray_embeddings: Tensor | None,
         depth_latents: Tensor | None = None,
+        temporal_tokens: Tensor | None = None,
+        temporal_box_12d: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Forward pass of the 3D detection head.
 
@@ -250,6 +325,10 @@ class Det3DHead(nn.Module):
             hidden_states: Query hidden states [num_layers, B, num_queries, embed_dims].
             ray_embeddings: Ray embeddings [B, H*W, 81]. Can be None if use_camera_prompt=False.
             depth_latents: Depth latent features [B, H*W, depth_embed_dims].
+            temporal_tokens: Track C temporal tokens [B, n_tok, traj_token_dim],
+                shared across decoder layers. None for the base head.
+            temporal_box_12d: Track C residual base [B, num_queries, reg_dims]
+                (or broadcastable), shared across decoder layers. None for base.
 
         Returns:
             Tuple of (stacked_reg, stacked_conf):
@@ -263,7 +342,12 @@ class Det3DHead(nn.Module):
             hidden_state = hidden_states[layer_id]
 
             reg_output, conf_output = self.single_forward(
-                layer_id, hidden_state, ray_embeddings, depth_latents
+                layer_id,
+                hidden_state,
+                ray_embeddings,
+                depth_latents,
+                temporal_tokens=temporal_tokens,
+                temporal_box_12d=temporal_box_12d,
             )
 
             all_layers_outputs_3d.append(reg_output)
