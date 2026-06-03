@@ -19,8 +19,9 @@ import time
 
 import torch
 from torch.utils.data import DataLoader
-from vis4d.op.geometry.rotation import quaternion_to_matrix
+from vis4d.op.geometry.rotation import matrix_to_quaternion, quaternion_to_matrix
 
+from wilddet3d.ops.iou_3d_safe import batch_box3d_iou
 from wilddet3d.ops.rotation import rotation_6d_to_matrix
 from wilddet3d.track_c import TrackCRefiner, track_c_loss
 from wilddet3d.track_c.dataset import (
@@ -64,7 +65,8 @@ def _box_repr_to_cdr(box_repr):
 @torch.no_grad()
 def evaluate(refiner, loader, dev):
     refiner.eval()
-    agg = {s: {"center": 0.0, "dims": 0.0, "rot": 0.0} for s in ("input", "traj_enc", "track_c")}
+    agg = {s: {"center": 0.0, "dims": 0.0, "rot": 0.0, "iou": 0.0}
+           for s in ("input", "traj_enc", "track_c")}
     nfr = 0
     for pack in loader:
         pack = to_dev(pack, dev)
@@ -76,6 +78,7 @@ def evaluate(refiner, loader, dev):
         if n == 0:
             continue
         nfr += n
+        gt_box10 = torch.cat([gt_c, gt_d, pack["gt_quat"]], dim=-1)  # [T,10]
 
         # input prior
         c, d, R = _box_repr_to_cdr(pack["box_repr"])
@@ -93,15 +96,20 @@ def evaluate(refiner, loader, dev):
             ce = (pc - gt_c).norm(dim=-1)[valid].sum().item()
             de = (pd - gt_d).abs().mean(dim=-1)[valid].sum().item()
             re = geodesic_rotation_loss(pR, gt_R, True)[valid].sum().item()
+            pquat = matrix_to_quaternion(pR)
+            pbox10 = torch.cat([pc, pd, pquat], dim=-1)
+            iou = batch_box3d_iou(pbox10[valid], gt_box10[valid]).sum().item()
             agg[s]["center"] += ce
             agg[s]["dims"] += de
             agg[s]["rot"] += re
+            agg[s]["iou"] += iou
     out = {}
     for s in agg:
         out[s] = {
             "center_m": agg[s]["center"] / max(nfr, 1),
             "dims_m": agg[s]["dims"] / max(nfr, 1),
             "rot_deg": agg[s]["rot"] / max(nfr, 1) * 180.0 / math.pi,
+            "iou3d": agg[s]["iou"] / max(nfr, 1),
         }
     out["_n_frames"] = nfr
     return out
@@ -116,6 +124,8 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--accum", type=int, default=8, help="trajectories per optimizer step")
     ap.add_argument("--val_frac", type=float, default=0.05)
+    ap.add_argument("--gate_lr_mult", type=float, default=20.0,
+                    help="LR multiplier for the new temporal modules (gate/prompt)")
     ap.add_argument("--reg_residual_from_prior", type=int, default=1)
     ap.add_argument("--w_center", type=float, default=1.0)
     ap.add_argument("--w_depth", type=float, default=1.0)
@@ -204,16 +214,17 @@ def main():
         if (ep + 1) % args.eval_every == 0 or ep == args.epochs - 1:
             ev = evaluate(refiner, val_loader, dev)
             tc = ev["track_c"]; inp = ev["input"]
-            print(f"[ep {ep}] EVAL track_c: center={tc['center_m']:.3f}m dims={tc['dims_m']:.3f}m "
-                  f"rot={tc['rot_deg']:.2f}deg | input: center={inp['center_m']:.3f}m "
-                  f"dims={inp['dims_m']:.3f}m rot={inp['rot_deg']:.2f}deg | nfr={ev['_n_frames']}",
+            print(f"[ep {ep}] EVAL track_c: iou3d={tc['iou3d']:.3f} center={tc['center_m']:.3f}m "
+                  f"dims={tc['dims_m']:.3f}m rot={tc['rot_deg']:.2f}deg | input(step4): "
+                  f"iou3d={inp['iou3d']:.3f} center={inp['center_m']:.3f}m dims={inp['dims_m']:.3f}m "
+                  f"rot={inp['rot_deg']:.2f}deg | nfr={ev['_n_frames']}",
                   flush=True)
-            score = tc["center_m"] + tc["dims_m"] + tc["rot_deg"] * math.pi / 180.0
+            score = -tc["iou3d"]  # maximize 3D IoU (lower score = better)
             if score < best:
                 best = score
                 torch.save({"refiner": refiner.state_dict(), "args": vars(args),
                             "epoch": ep, "eval": ev}, f"{args.out_dir}/best.pt")
-                print(f"[ep {ep}] saved best (score={score:.4f})", flush=True)
+                print(f"[ep {ep}] saved best (iou3d={tc['iou3d']:.4f})", flush=True)
     torch.save({"refiner": refiner.state_dict(), "args": vars(args)},
                f"{args.out_dir}/last.pt")
     print("[train] done", flush=True)
