@@ -52,12 +52,36 @@ class _FramesLRU:
             self.store.popitem(last=False)
         return fc
 
+    def preload(self, video_ids) -> None:
+        """Load all given videos' frames files into RAM once and disable
+        eviction, so epochs incur zero re-deserialization."""
+        vids = sorted(set(video_ids))
+        self.maxsize = len(vids) + 4
+        import time as _t
+        t0 = _t.time()
+        for k, v in enumerate(vids):
+            if v not in self.store:
+                self.store[v] = torch.load(
+                    f"{self.cache_dir}/frames/{v}.pt", weights_only=False)
+            if (k + 1) % 200 == 0:
+                print(f"[preload] {k+1}/{len(vids)} frames files "
+                      f"({_t.time()-t0:.0f}s)", flush=True)
+        print(f"[preload] {len(vids)} frames files into RAM "
+              f"({_t.time()-t0:.0f}s)", flush=True)
+
 
 class CachedTrackCDataset(Dataset):
-    def __init__(self, cache_dir: str, traj_paths: List[str], lru: int = 8):
+    def __init__(self, cache_dir: str, traj_paths: List[str], lru: int = 8,
+                 preload: bool = False):
         self.cache_dir = cache_dir
         self.traj_paths = traj_paths
         self.frames = _FramesLRU(cache_dir, maxsize=lru)
+        self.traj_cache = None
+        if preload:
+            self.frames.preload(
+                os.path.basename(p).split("__")[0] for p in traj_paths)
+            self.traj_cache = [
+                torch.load(p, weights_only=False) for p in traj_paths]
 
     def __len__(self):
         return len(self.traj_paths)
@@ -66,16 +90,19 @@ class CachedTrackCDataset(Dataset):
         return os.path.basename(self.traj_paths[i]).split("__")[0]
 
     def __getitem__(self, i: int) -> dict:
-        traj = torch.load(self.traj_paths[i], weights_only=False)
+        traj = (self.traj_cache[i] if self.traj_cache is not None
+                else torch.load(self.traj_paths[i], weights_only=False))
         vid = traj["video_id"]
         fc = self.frames.get(vid)
         idxs = traj["frame_index"].tolist()
-        depth = torch.stack([fc[ix]["depth_latents"] for ix in idxs], 0).float()   # [T,2401,256]
-        ray = torch.stack([fc[ix]["ray"] for ix in idxs], 0).float()               # [T,2401,81]
-        K = fc[idxs[0]]["K"]                                                        # [3,3]
+        # Keep the big tensors bf16 here; convert to float on the GPU in the
+        # train step (CPU bf16->fp32 is slow and would stall the GPU).
+        depth = torch.stack([fc[ix]["depth_latents"] for ix in idxs], 0)   # bf16 [T,2401,256]
+        ray = torch.stack([fc[ix]["ray"] for ix in idxs], 0)              # bf16 [T,2401,81]
+        K = fc[idxs[0]]["K"]                                              # [3,3]
         input_hw = fc[idxs[0]]["input_hw"]
         # hidden cached as [T,L,256]; head wants [L,T,1,256]
-        hidden = traj["hidden"].float().permute(1, 0, 2).unsqueeze(2)              # [L,T,1,256]
+        hidden = traj["hidden"].permute(1, 0, 2).unsqueeze(2)            # bf16 [L,T,1,256]
         return {
             "hidden": hidden,
             "ray": ray,
@@ -126,3 +153,40 @@ class VideoGroupedSampler(Sampler):
 
     def __len__(self):
         return len(self.ds)
+
+
+def collate_trajs(packs: list) -> dict:
+    """Collate K per-trajectory packs into one vectorized batch.
+
+    Sequences (for the trajectory encoder) are padded to Tmax with a pad mask;
+    per-frame head inputs + GT are concatenated in (k, then t) order so they line
+    up with ``encoder_tokens[~pad_mask]``. Per-frame intrinsics are built by
+    repeating each trajectory's single K across its frames.
+    """
+    K = len(packs)
+    Ts = [p["box_repr"].shape[0] for p in packs]
+    Tmax = max(Ts)
+    box_repr = torch.zeros(K, Tmax, packs[0]["box_repr"].shape[1])
+    ts = torch.zeros(K, Tmax)
+    measured = torch.zeros(K, Tmax, dtype=torch.bool)
+    pad_mask = torch.ones(K, Tmax, dtype=torch.bool)
+    for k, (p, t) in enumerate(zip(packs, Ts)):
+        box_repr[k, :t] = p["box_repr"]
+        ts[k, :t] = p["ts"]
+        measured[k, :t] = p["measured"]
+        pad_mask[k, :t] = False
+    hidden = torch.cat([p["hidden"] for p in packs], dim=1)          # [L, sumT, 1, 256]
+    ray = torch.cat([p["ray"] for p in packs], dim=0)               # [sumT, ntok, 81]
+    depth = torch.cat([p["depth"] for p in packs], dim=0)           # [sumT, ntok, 256]
+    box2d = torch.cat([p["box2d"] for p in packs], dim=0)           # [sumT, 4]
+    K_pf = torch.cat([p["K"].unsqueeze(0).expand(t, 3, 3)
+                      for p, t in zip(packs, Ts)], dim=0)            # [sumT, 3, 3]
+    gt_center = torch.cat([p["gt_center"] for p in packs], dim=0)
+    gt_dims = torch.cat([p["gt_dims"] for p in packs], dim=0)
+    gt_quat = torch.cat([p["gt_quat"] for p in packs], dim=0)
+    return {
+        "box_repr": box_repr, "ts": ts, "measured": measured, "pad_mask": pad_mask,
+        "hidden": hidden, "ray": ray, "depth": depth, "box2d": box2d, "K": K_pf,
+        "gt_center": gt_center, "gt_dims": gt_dims, "gt_quat": gt_quat,
+        "input_hw": packs[0]["input_hw"],
+    }

@@ -97,7 +97,10 @@ class TrackCRefiner(nn.Module):
         log_dims = box_repr_abs[:, 3:6]
         rot6d = box_repr_abs[:, 6:12]
 
-        proj = project_points(center, intrinsics)              # [B,2] model px
+        if intrinsics.dim() == 2:
+            proj = project_points(center, intrinsics)          # [B,2] (shared K)
+        else:
+            proj = project_points(center.unsqueeze(1), intrinsics).squeeze(1)  # per-frame K
         ctr_x = (pred_box_2d_norm[:, 0] + pred_box_2d_norm[:, 2]) * 0.5 * W
         ctr_y = (pred_box_2d_norm[:, 1] + pred_box_2d_norm[:, 3]) * 0.5 * H
         center_2d = torch.stack([ctr_x, ctr_y], -1)
@@ -128,13 +131,21 @@ class TrackCRefiner(nn.Module):
         tokens = tokens[0]                           # [T,256]
         box_out = box_out[0]                         # [T,12] temporal-aware abs box
 
-        temporal_box_12d = self.encode_temporal_box_12d(
-            box_out, pred_box_2d, intrinsics, input_hw
-        )                                            # [T,12] coder space
+        # The temporal box is the output-space anchor; compute its 12-d encoding
+        # (projection geometry) in fp32 even under bf16 autocast, so the box
+        # center isn't perturbed by bf16 rounding.
+        with torch.autocast(device_type="cuda", enabled=False):
+            temporal_box_12d = self.encode_temporal_box_12d(
+                box_out.float(), pred_box_2d.float(), intrinsics.float(), input_hw
+            )                                        # [T,12] coder space (fp32)
 
         # head batch = T frames, S=1 query each
         temporal_tokens = tokens.unsqueeze(1)        # [T,1,256]
-        temporal_box_in = temporal_box_12d.unsqueeze(1)  # [T,1,12]
+        # residual-from-prior: add the temporal box as the output base (reg is
+        # zero-init). residual-from-pretrained: no additive base (keep pretrained
+        # reg as the anchor), temporal info flows only via the gated prompt.
+        temporal_box_in = (temporal_box_12d.unsqueeze(1)
+                           if self.reg_residual_from_prior else None)
         stacked_reg, stacked_conf = self.head(
             hidden_states=hidden_states,
             ray_embeddings=ray_embeddings,
@@ -148,6 +159,75 @@ class TrackCRefiner(nn.Module):
             "temporal_box_12d": temporal_box_12d,    # [T,12]
             "traj_box_out": box_out,                 # [T,12] abs cam prior (refined)
         }
+
+    def forward_batch(self, packs: list) -> dict:
+        """Batched forward over many trajectories for training throughput.
+
+        The cheap per-trajectory parts (trajectory encoder + temporal-box
+        geometry, each needing that trajectory's single intrinsics) run in a
+        loop; the expensive 3D head runs ONCE over all trajectories' frames
+        concatenated along the query/batch dim. Returns concatenated reg plus
+        per-trajectory sizes so the loss/decode can split frames back.
+        """
+        toks, tb12s, hiddens, rays, depths, box_outs, sizes = [], [], [], [], [], [], []
+        for p in packs:
+            tokens, box_out = self.traj_encoder(
+                p["box_repr"].unsqueeze(0), p["ts"].unsqueeze(0),
+                p["measured"].unsqueeze(0))
+            tokens = tokens[0]
+            box_out = box_out[0]
+            with torch.autocast(device_type="cuda", enabled=False):
+                tb = self.encode_temporal_box_12d(
+                    box_out.float(), p["box2d"].float(), p["K"].float(), p["input_hw"])
+            toks.append(tokens)
+            tb12s.append(tb)
+            box_outs.append(box_out)
+            hiddens.append(p["hidden"])
+            rays.append(p["ray"])
+            depths.append(p["depth"])
+            sizes.append(tokens.shape[0])
+        hidden = torch.cat(hiddens, dim=1)                 # [L, sum_T, 1, 256]
+        ray = torch.cat(rays, dim=0)                       # [sum_T, ntok, 81]
+        depth = torch.cat(depths, dim=0)                   # [sum_T, ntok, 256]
+        temporal_tokens = torch.cat(toks, 0).unsqueeze(1)  # [sum_T, 1, 256]
+        temporal_box_in = torch.cat(tb12s, 0).unsqueeze(1)  # [sum_T, 1, 12]
+        stacked_reg, stacked_conf = self.head(
+            hidden_states=hidden, ray_embeddings=ray, depth_latents=depth,
+            temporal_tokens=temporal_tokens, temporal_box_12d=temporal_box_in,
+        )                                                  # [L, sum_T, 1, 12]
+        return {"reg": stacked_reg, "conf": stacked_conf,
+                "sizes": sizes, "box_out": box_outs}
+
+    def forward_vectorized(self, batch: dict) -> dict:
+        """Fully-vectorized batched forward (no per-trajectory Python loop).
+
+        ``batch`` (from ``collate_trajs``):
+          box_repr/ts/measured/pad_mask  [K, Tmax, *]  (padded, for the encoder)
+          hidden [L, sum_T, 1, 256], ray [sum_T, ntok, 81], depth [sum_T, ntok, 256],
+          box2d [sum_T, 4], K [sum_T, 3, 3] (per-frame), input_hw
+        Valid (non-pad) frames in row-major (k, t) order match the concatenated
+        head inputs, so ``tokens[~pad_mask]`` aligns with them.
+        """
+        tokens, box_out = self.traj_encoder(
+            batch["box_repr"], batch["ts"], batch["measured"],
+            key_padding_mask=batch["pad_mask"])          # [K,Tmax,256], [K,Tmax,12]
+        valid = ~batch["pad_mask"]                       # [K,Tmax]
+        tokens_v = tokens[valid]                         # [sum_T, 256]
+        box_out_v = box_out[valid]                       # [sum_T, 12]
+        with torch.autocast(device_type="cuda", enabled=False):
+            temporal_box_12d = self.encode_temporal_box_12d(
+                box_out_v.float(), batch["box2d"].float(), batch["K"].float(),
+                batch["input_hw"])                       # [sum_T, 12] (per-frame K, fp32)
+        temporal_box_in = (temporal_box_12d.unsqueeze(1)
+                           if self.reg_residual_from_prior else None)
+        stacked_reg, stacked_conf = self.head(
+            hidden_states=batch["hidden"], ray_embeddings=batch["ray"],
+            depth_latents=batch["depth"],
+            temporal_tokens=tokens_v.unsqueeze(1),
+            temporal_box_12d=temporal_box_in,
+        )                                                # [L, sum_T, 1, 12]
+        return {"reg": stacked_reg, "conf": stacked_conf,
+                "box_out": box_out_v, "temporal_box_12d": temporal_box_12d}
 
     def decode_layer(self, reg_layer: Tensor, pred_box_2d: Tensor,
                      intrinsics: Tensor, input_hw) -> Tensor:

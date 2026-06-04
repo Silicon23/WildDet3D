@@ -24,9 +24,15 @@ from vis4d.op.geometry.rotation import matrix_to_quaternion, quaternion_to_matri
 from wilddet3d.ops.iou_3d_safe import batch_box3d_iou
 from wilddet3d.ops.rotation import rotation_6d_to_matrix
 from wilddet3d.track_c import TrackCRefiner, track_c_loss
+from wilddet3d.track_c.losses import (
+    build_targets,
+    encode_targets_batched,
+    track_c_loss_from_targets,
+)
 from wilddet3d.track_c.dataset import (
     CachedTrackCDataset,
     VideoGroupedSampler,
+    collate_trajs,
     list_cached_trajectories,
     split_by_video,
 )
@@ -38,18 +44,41 @@ def to_dev(pack, dev):
 
 
 def forward_loss(refiner, pack, loss_kw):
-    out = refiner(
-        hidden_states=pack["hidden"], ray_embeddings=pack["ray"],
-        depth_latents=pack["depth"], pred_box_2d=pack["box2d"],
-        intrinsics=pack["K"], box_repr=pack["box_repr"],
-        timestamps=pack["ts"], measured_mask=pack["measured"],
-        input_hw=pack["input_hw"],
-    )
+    # bf16 autocast for the heavy 3D-head/traj-encoder matmuls; the temporal-box
+    # geometry stays fp32 (forced inside refiner.forward) and the loss runs fp32.
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = refiner(
+            hidden_states=pack["hidden"], ray_embeddings=pack["ray"],
+            depth_latents=pack["depth"], pred_box_2d=pack["box2d"],
+            intrinsics=pack["K"], box_repr=pack["box_repr"],
+            timestamps=pack["ts"], measured_mask=pack["measured"],
+            input_hw=pack["input_hw"],
+        )
     gt_R = quaternion_to_matrix(pack["gt_quat"])
     loss = track_c_loss(
-        out["reg"], refiner.coder, pack["gt_center"], pack["gt_dims"],
+        out["reg"].float(), refiner.coder, pack["gt_center"], pack["gt_dims"],
         pack["gt_quat"], gt_R, pack["box2d"], pack["K"], pack["input_hw"],
         valid=(pack["gt_center"][:, 2] > 1e-3), **loss_kw,
+    )
+    return out, loss
+
+
+def forward_loss_batch(refiner, packs, loss_kw):
+    """Batched training step: one head forward over many trajectories' frames."""
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = refiner.forward_batch(packs)
+    pred = out["reg"][:, :, 0, :].float()                  # [L, sum_T, 12]
+    targets, weights, gtRs, valids = [], [], [], []
+    for p in packs:
+        tgt, w = build_targets(refiner.coder, p["gt_center"], p["gt_dims"],
+                               p["gt_quat"], p["box2d"], p["K"], p["input_hw"])
+        targets.append(tgt)
+        weights.append(w)
+        gtRs.append(quaternion_to_matrix(p["gt_quat"]))
+        valids.append(p["gt_center"][:, 2] > 1e-3)
+    loss = track_c_loss_from_targets(
+        pred, torch.cat(targets, 0), torch.cat(weights, 0),
+        torch.cat(gtRs, 0), torch.cat(valids, 0), **loss_kw,
     )
     return out, loss
 
@@ -122,11 +151,16 @@ def main():
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--accum", type=int, default=8, help="trajectories per optimizer step")
+    ap.add_argument("--accum", type=int, default=8, help="(unused in batched loop)")
+    ap.add_argument("--batch_trajs", type=int, default=8,
+                    help="trajectories concatenated per batched head forward / step")
     ap.add_argument("--val_frac", type=float, default=0.05)
     ap.add_argument("--gate_lr_mult", type=float, default=20.0,
                     help="LR multiplier for the new temporal modules (gate/prompt)")
     ap.add_argument("--reg_residual_from_prior", type=int, default=1)
+    ap.add_argument("--no_temporal", type=int, default=0,
+                    help="ablation: freeze the temporal-prompt gate at 0 (no "
+                         "temporal cross-attention; pure per-frame image grounding)")
     ap.add_argument("--w_center", type=float, default=1.0)
     ap.add_argument("--w_depth", type=float, default=1.0)
     ap.add_argument("--w_dims", type=float, default=1.0)
@@ -145,16 +179,25 @@ def main():
     print(f"[data] {len(paths)} trajs -> train {len(train_paths)} / val {len(val_paths)} "
           f"({len(val_vids)} val videos)", flush=True)
 
-    train_ds = CachedTrackCDataset(args.cache_dir, train_paths)
-    val_ds = CachedTrackCDataset(args.cache_dir, val_paths)
+    print("[data] preloading frames + traj features into RAM ...", flush=True)
+    train_ds = CachedTrackCDataset(args.cache_dir, train_paths, preload=True)
+    val_ds = CachedTrackCDataset(args.cache_dir, val_paths, preload=True)
     train_sampler = VideoGroupedSampler(train_ds, shuffle=True)
-    train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=None, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=None, num_workers=4)
+    # num_workers=0: keep the per-video frames-file LRU in one process so the
+    # video-grouped sampler loads each ~90MB frames file once per epoch. With
+    # workers, round-robin index distribution defeats that locality.
+    train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=None, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=None, num_workers=0)
 
     refiner = TrackCRefiner(reg_residual_from_prior=bool(args.reg_residual_from_prior)).to(dev)
     info = refiner.load_pretrained_head(args.ckpt)
     print(f"[build] head load: {info['loaded']} tensors, new={len(info['missing'])}", flush=True)
     refiner.finalize_init()
+    if args.no_temporal:
+        for g in refiner.head.temporal_gate:
+            g.data.zero_()
+            g.requires_grad_(False)
+        print("[build] no_temporal: temporal-prompt gates frozen at 0 (ablation)", flush=True)
 
     # Higher LR for the new temporal modules (esp. the zero-init LayerScale gate)
     # so the image-grounded temporal-prompt pathway activates from a cold start,
@@ -175,7 +218,7 @@ def main():
     print(f"[build] param groups: base={sum(p.numel() for p in base_params)/1e6:.2f}M "
           f"temporal={sum(p.numel() for p in temporal_params)/1e6:.2f}M "
           f"(temporal lr x{args.gate_lr_mult})", flush=True)
-    total_steps = args.epochs * max(1, len(train_paths) // args.accum)
+    total_steps = args.epochs * max(1, len(train_paths) // args.batch_trajs)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, total_steps))
     loss_kw = dict(w_center=args.w_center, w_depth=args.w_depth,
                    w_dims=args.w_dims, w_rot=args.w_rot)
@@ -185,28 +228,37 @@ def main():
     print("  " + json.dumps(ev), flush=True)
 
     best = 1e9
+    K = args.batch_trajs
     for ep in range(args.epochs):
         refiner.train()
         train_sampler.set_epoch(ep)
         t0 = time.time()
-        running, ncount, accum_n = 0.0, 0, 0
+        running, nstep, logs = 0.0, 0, None
+        idxs = list(iter(train_sampler))
         opt.zero_grad()
-        logs = None
-        for pack in train_loader:
-            pack = to_dev(pack, dev)
-            out, loss = forward_loss(refiner, pack, loss_kw)
-            (loss["loss"] / args.accum).backward()
-            running += float(loss["loss"]); ncount += 1; accum_n += 1
-            logs = loss
-            if accum_n >= args.accum:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in refiner.parameters() if p.requires_grad], 5.0)
-                opt.step(); sched.step(); opt.zero_grad(); accum_n = 0
-        if accum_n > 0:
-            opt.step(); opt.zero_grad()
+        for bstart in range(0, len(idxs), K):
+            packs = [train_ds[i] for i in idxs[bstart:bstart + K]]
+            batch = to_dev(collate_trajs(packs), dev)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = refiner.forward_vectorized(batch)
+            pred = out["reg"][:, :, 0, :].float()
+            target, weights = encode_targets_batched(
+                refiner.coder, batch["gt_center"], batch["gt_dims"],
+                batch["gt_quat"], batch["box2d"], batch["K"], batch["input_hw"])
+            loss = track_c_loss_from_targets(
+                pred, target, weights, quaternion_to_matrix(batch["gt_quat"]),
+                batch["gt_center"][:, 2] > 1e-3, **loss_kw)
+            loss["loss"].backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in refiner.parameters() if p.requires_grad], 5.0)
+            opt.step(); sched.step(); opt.zero_grad()
+            running += float(loss["loss"]); nstep += 1; logs = loss
         dt = time.time() - t0
-        gate = refiner.head.temporal_gate[-1].abs().mean().item()
-        print(f"[ep {ep}] train_loss={running/max(ncount,1):.4f} "
+        # mean over the USED prediction layers (exclude the last clone, which the
+        # 6-decoder-layer forward never invokes, so it stays at its zero init).
+        gate = torch.stack([g.abs().mean()
+                            for g in refiner.head.temporal_gate[:-1]]).mean().item()
+        print(f"[ep {ep}] train_loss={running/max(nstep,1):.4f} "
               f"(center={float(logs['loss_center']):.3f} depth={float(logs['loss_depth']):.3f} "
               f"dims={float(logs['loss_dims']):.3f} rot_deg={float(logs['loss_rot_deg']):.2f}) "
               f"gate|.|={gate:.4f} lr={sched.get_last_lr()[0]:.2e} {dt:.0f}s", flush=True)
