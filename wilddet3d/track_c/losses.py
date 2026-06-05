@@ -167,6 +167,65 @@ def track_c_loss_from_targets(
     }
 
 
+def derivative_matching_loss(
+    pred_center: Tensor,     # [N,3] decoded camera-frame centers (concat over trajs)
+    pred_R: Tensor,          # [N,3,3]
+    gt_center: Tensor,       # [N,3]
+    gt_R: Tensor,            # [N,3,3]
+    sizes,                   # list[int] per-traj frame counts, concat order
+    valid: Tensor,           # [N] bool per-frame GT mask
+    w_vel: float = 1.0,
+    w_acc: float = 1.0,
+    w_rotvel: float = 1.0,
+    symmetry_aware: bool = True,
+) -> dict:
+    """GT-derivative MATCHING (not minimizing) for temporal smoothness.
+
+    Per trajectory (frame-ordered), match the prediction's finite-difference
+    dynamics to GT's: center velocity (1st diff) + acceleration (2nd diff), and
+    the symmetry-aware angular-velocity magnitude omega_t = sym_geodesic(R_t,R_{t+1}).
+    Matching (vs minimizing) penalizes only the high-frequency component of the
+    *error*, so it suppresses jitter without biasing toward a motion model. This
+    is the term that gives the temporal channel a job. Computed in decoded metric
+    space (m, rad) on the final head layer.
+    """
+    import torch as _t
+    off, s = [0], 0
+    for n in sizes:
+        s += int(n); off.append(s)
+    cv, ca, rv = [], [], []
+    for k in range(len(sizes)):
+        a, b = off[k], off[k + 1]
+        v = valid[a:b]
+        if int(v.sum()) < 2:
+            continue
+        cP, cG = pred_center[a:b], gt_center[a:b]
+        RP, RG = pred_R[a:b], gt_R[a:b]
+        # center velocity match (1st diff)
+        vp, vg = cP[1:] - cP[:-1], cG[1:] - cG[:-1]
+        cv.append((vp - vg).abs().sum(-1).mean())
+        # center acceleration match (2nd diff)
+        if (b - a) >= 3:
+            ap = cP[2:] - 2 * cP[1:-1] + cP[:-2]
+            ag = cG[2:] - 2 * cG[1:-1] + cG[:-2]
+            ca.append((ap - ag).abs().sum(-1).mean())
+        # angular velocity match (symmetry-folded geodesic step, radians)
+        op = geodesic_rotation_loss(RP[:-1], RP[1:], symmetry_aware)
+        og = geodesic_rotation_loss(RG[:-1], RG[1:], symmetry_aware)
+        rv.append((op - og).abs().mean())
+    z = pred_center.new_zeros(())
+    loss_cv = _t.stack(cv).mean() if cv else z
+    loss_ca = _t.stack(ca).mean() if ca else z
+    loss_rv = _t.stack(rv).mean() if rv else z
+    total = w_vel * loss_cv + w_acc * loss_ca + w_rotvel * loss_rv
+    return {
+        "loss": total,
+        "d_center_vel": loss_cv.detach(),
+        "d_center_acc": loss_ca.detach(),
+        "d_rot_vel_deg": loss_rv.detach() * 180.0 / math.pi,
+    }
+
+
 def track_c_loss(
     pred_reg: Tensor,        # [L,T,1,12] coder-encoded predictions
     coder: Det3DCoder,

@@ -26,6 +26,7 @@ from wilddet3d.ops.rotation import rotation_6d_to_matrix
 from wilddet3d.track_c import TrackCRefiner, track_c_loss
 from wilddet3d.track_c.losses import (
     build_targets,
+    derivative_matching_loss,
     encode_targets_batched,
     track_c_loss_from_targets,
 )
@@ -165,6 +166,12 @@ def main():
     ap.add_argument("--w_depth", type=float, default=1.0)
     ap.add_argument("--w_dims", type=float, default=1.0)
     ap.add_argument("--w_rot", type=float, default=1.0)
+    ap.add_argument("--w_vel", type=float, default=0.0,
+                    help="GT-derivative match: center velocity (1st diff)")
+    ap.add_argument("--w_acc", type=float, default=0.0,
+                    help="GT-derivative match: center acceleration (2nd diff)")
+    ap.add_argument("--w_rotvel", type=float, default=0.0,
+                    help="GT-derivative match: angular velocity (deg, symmetry-aware) — the main smoothness term")
     ap.add_argument("--eval_every", type=int, default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit", type=int, default=0)
@@ -228,12 +235,13 @@ def main():
     print("  " + json.dumps(ev), flush=True)
 
     best = 1e9
+    history = []
     K = args.batch_trajs
     for ep in range(args.epochs):
         refiner.train()
         train_sampler.set_epoch(ep)
         t0 = time.time()
-        running, nstep, logs = 0.0, 0, None
+        running, nstep, logs, dlogs = 0.0, 0, None, None
         idxs = list(iter(train_sampler))
         opt.zero_grad()
         for bstart in range(0, len(idxs), K):
@@ -242,27 +250,56 @@ def main():
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = refiner.forward_vectorized(batch)
             pred = out["reg"][:, :, 0, :].float()
+            valid = batch["gt_center"][:, 2] > 1e-3
+            gt_R = quaternion_to_matrix(batch["gt_quat"])
             target, weights = encode_targets_batched(
                 refiner.coder, batch["gt_center"], batch["gt_dims"],
                 batch["gt_quat"], batch["box2d"], batch["K"], batch["input_hw"])
-            loss = track_c_loss_from_targets(
-                pred, target, weights, quaternion_to_matrix(batch["gt_quat"]),
-                batch["gt_center"][:, 2] > 1e-3, **loss_kw)
-            loss["loss"].backward()
+            loss = track_c_loss_from_targets(pred, target, weights, gt_R, valid, **loss_kw)
+            total = loss["loss"]
+            dlog = None
+            if (args.w_vel + args.w_acc + args.w_rotvel) > 0:
+                # decode final-layer boxes per trajectory (single K each) in fp32
+                reg_f = pred[-1]
+                off, pcs, pRs = 0, [], []
+                for n in batch["sizes"]:
+                    sl = slice(off, off + int(n)); off += int(n)
+                    dec = refiner.decode_layer(reg_f[sl], batch["box2d"][sl],
+                                               batch["K"][sl][0], batch["input_hw"])
+                    pcs.append(dec[:, 0:3]); pRs.append(quaternion_to_matrix(dec[:, 6:10]))
+                dlog = derivative_matching_loss(
+                    torch.cat(pcs, 0), torch.cat(pRs, 0), batch["gt_center"], gt_R,
+                    batch["sizes"], valid, w_vel=args.w_vel, w_acc=args.w_acc,
+                    w_rotvel=args.w_rotvel)
+                total = total + dlog["loss"]
+            total.backward()
             torch.nn.utils.clip_grad_norm_(
                 [p for p in refiner.parameters() if p.requires_grad], 5.0)
             opt.step(); sched.step(); opt.zero_grad()
-            running += float(loss["loss"]); nstep += 1; logs = loss
+            running += float(total); nstep += 1; logs = loss; dlogs = dlog
         dt = time.time() - t0
         # mean over the USED prediction layers (exclude the last clone, which the
         # 6-decoder-layer forward never invokes, so it stays at its zero init).
         gate = torch.stack([g.abs().mean()
                             for g in refiner.head.temporal_gate[:-1]]).mean().item()
+        dstr = ""
+        if dlogs is not None:
+            dstr = (f" deriv(cvel={float(dlogs['d_center_vel']):.3f} "
+                    f"cacc={float(dlogs['d_center_acc']):.3f} "
+                    f"rotvel_deg={float(dlogs['d_rot_vel_deg']):.2f})")
         print(f"[ep {ep}] train_loss={running/max(nstep,1):.4f} "
               f"(center={float(logs['loss_center']):.3f} depth={float(logs['loss_depth']):.3f} "
-              f"dims={float(logs['loss_dims']):.3f} rot_deg={float(logs['loss_rot_deg']):.2f}) "
+              f"dims={float(logs['loss_dims']):.3f} rot_deg={float(logs['loss_rot_deg']):.2f}){dstr} "
               f"gate|.|={gate:.4f} lr={sched.get_last_lr()[0]:.2e} {dt:.0f}s", flush=True)
 
+        rec = {"epoch": ep, "train_loss": running / max(nstep, 1),
+               "loss_center": float(logs['loss_center']), "loss_depth": float(logs['loss_depth']),
+               "loss_dims": float(logs['loss_dims']), "loss_rot_deg": float(logs['loss_rot_deg']),
+               "gate": gate, "lr": sched.get_last_lr()[0], "epoch_sec": dt}
+        if dlogs is not None:
+            rec.update(d_center_vel=float(dlogs['d_center_vel']),
+                       d_center_acc=float(dlogs['d_center_acc']),
+                       d_rot_vel_deg=float(dlogs['d_rot_vel_deg']))
         if (ep + 1) % args.eval_every == 0 or ep == args.epochs - 1:
             ev = evaluate(refiner, val_loader, dev)
             tc = ev["track_c"]; inp = ev["input"]
@@ -271,12 +308,16 @@ def main():
                   f"iou3d={inp['iou3d']:.3f} center={inp['center_m']:.3f}m dims={inp['dims_m']:.3f}m "
                   f"rot={inp['rot_deg']:.2f}deg | nfr={ev['_n_frames']}",
                   flush=True)
+            rec["eval"] = ev
             score = -tc["iou3d"]  # maximize 3D IoU (lower score = better)
             if score < best:
                 best = score
                 torch.save({"refiner": refiner.state_dict(), "args": vars(args),
                             "epoch": ep, "eval": ev}, f"{args.out_dir}/best.pt")
                 print(f"[ep {ep}] saved best (iou3d={tc['iou3d']:.4f})", flush=True)
+        history.append(rec)
+        with open(f"{args.out_dir}/history.json", "w") as f:
+            json.dump(history, f, indent=1)
     torch.save({"refiner": refiner.state_dict(), "args": vars(args)},
                f"{args.out_dir}/last.pt")
     print("[train] done", flush=True)

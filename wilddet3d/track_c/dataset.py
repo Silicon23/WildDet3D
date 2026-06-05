@@ -189,4 +189,5 @@ def collate_trajs(packs: list) -> dict:
         "hidden": hidden, "ray": ray, "depth": depth, "box2d": box2d, "K": K_pf,
         "gt_center": gt_center, "gt_dims": gt_dims, "gt_quat": gt_quat,
         "input_hw": packs[0]["input_hw"],
+        "sizes": Ts,   # per-trajectory frame counts (concat order), for derivative loss
     }
