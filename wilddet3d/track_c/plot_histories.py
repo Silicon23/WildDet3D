@@ -11,8 +11,8 @@ import matplotlib.pyplot as plt
 RUNS = "/weka/oe-training-default/weikaih/3d_boundingbox_detection/video_3d_box/itw_3dbox_det/outputs/track_c/runs"
 PLOTS = "/weka/oe-training-default/weikaih/3d_boundingbox_detection/video_3d_box/itw_3dbox_det/outputs/track_c/plots"
 os.makedirs(PLOTS, exist_ok=True)
-order = ["v1", "v2_from_pretrained", "v3_no_temporal", "v4_deriv_on",
-         "v5_deriv_off", "v6_deriv_gentle", "v7_deriv_moderate"]
+order = sorted(os.path.basename(p) for p in glob.glob(f"{RUNS}/v*")
+               if os.path.isdir(p) and os.path.exists(f"{p}/history.csv"))
 
 
 def load(run):
