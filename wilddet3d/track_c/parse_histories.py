@@ -2,8 +2,8 @@
 import re, glob, os, csv
 
 RUNS = "/weka/oe-training-default/weikaih/3d_boundingbox_detection/video_3d_box/itw_3dbox_det/outputs/track_c/runs"
-order = ["v1", "v2_from_pretrained", "v3_no_temporal", "v4_deriv_on",
-         "v5_deriv_off", "v6_deriv_gentle", "v7_deriv_moderate"]
+order = sorted(os.path.basename(p) for p in glob.glob(f"{RUNS}/v*")
+               if os.path.isdir(p) and os.path.exists(f"{p}/train.log"))
 
 tr = re.compile(r"\[ep (\d+)\] train_loss=([\d.]+) \(center=([\d.]+) depth=([\d.]+) "
                 r"dims=([\d.]+) rot_deg=([\d.]+)\)(?: deriv\(cvel=([\d.]+) cacc=([\d.]+) "
