@@ -24,13 +24,31 @@ def list_cached_trajectories(cache_dir: str) -> List[str]:
     return sorted(glob.glob(f"{cache_dir}/traj/*.pt"))
 
 
-def split_by_video(traj_paths: List[str], val_frac: float = 0.05, seed: int = 0):
-    """Split trajectory files into train/val by VIDEO id."""
+CANONICAL_VAL_SPLIT = (
+    "/weka/oe-training-default/weikaih/3d_boundingbox_detection/video_3d_box/"
+    "itw_3dbox_det/outputs/track_c/val_split.json"
+)
+
+
+def split_by_video(traj_paths: List[str], val_frac: float = 0.05, seed: int = 0,
+                   split_file: str = CANONICAL_VAL_SPLIT):
+    """Split trajectory files into train/val by VIDEO id.
+
+    If ``split_file`` exists, the persisted val_video_ids are used verbatim
+    (matched to v1..v10's eval set so new runs remain directly comparable).
+    Otherwise falls back to the torch-RNG split — useful only for forensics.
+    """
     vids = sorted({os.path.basename(p).split("__")[0] for p in traj_paths})
-    g = torch.Generator().manual_seed(seed)
-    perm = torch.randperm(len(vids), generator=g).tolist()
-    n_val = max(1, int(len(vids) * val_frac))
-    val_vids = set(vids[i] for i in perm[:n_val])
+    if split_file and os.path.exists(split_file):
+        import json
+        with open(split_file) as f:
+            val_vids = set(json.load(f)["val_video_ids"])
+    else:
+        import torch
+        g = torch.Generator().manual_seed(seed)
+        perm = torch.randperm(len(vids), generator=g).tolist()
+        n_val = max(1, int(len(vids) * val_frac))
+        val_vids = set(vids[i] for i in perm[:n_val])
     train = [p for p in traj_paths if os.path.basename(p).split("__")[0] not in val_vids]
     val = [p for p in traj_paths if os.path.basename(p).split("__")[0] in val_vids]
     return train, val, sorted(val_vids)

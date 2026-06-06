@@ -75,6 +75,7 @@ class Det3DHead(nn.Module):
         use_depth_prompt: bool = True,
         use_temporal_prompt: bool = False,
         traj_token_dim: int = 256,
+        use_layer_bias: bool = False,
     ) -> None:
         """Initialize the 3D detection head.
 
@@ -96,6 +97,7 @@ class Det3DHead(nn.Module):
         self.use_camera_prompt = use_camera_prompt
         self.use_depth_prompt = use_depth_prompt
         self.use_temporal_prompt = use_temporal_prompt
+        self.use_layer_bias = use_layer_bias
 
         self.num_pred_layer = (
             num_decoder_layer + 1 if as_two_stage else num_decoder_layer
@@ -160,6 +162,18 @@ class Det3DHead(nn.Module):
             self.project_temporal = None
             self.prompt_temporal = None
             self.temporal_gate = None
+
+        # Per-layer learned additive bias (Track C v11_with_bias). Tests the
+        # "constant feature" hypothesis: replace the prompt_temporal collapse
+        # with the minimal-cost equivalent — a per-layer additive bias on the
+        # hidden state. Zero-init keeps identity at init.
+        if self.use_layer_bias:
+            self.layer_bias = nn.ParameterList(
+                [nn.Parameter(torch.zeros(embed_dims))
+                 for _ in range(self.num_pred_layer)]
+            )
+        else:
+            self.layer_bias = None
 
         self._init_weights()
 
@@ -300,6 +314,11 @@ class Det3DHead(nn.Module):
             hidden_state = hidden_state + self.temporal_gate[layer_id] * (
                 updated - hidden_state
             )
+
+        # Per-layer learned bias (Track C v11_with_bias). Replaces the
+        # collapsed-to-constant temporal cross-attn at ~256 params/layer.
+        if self.use_layer_bias:
+            hidden_state = hidden_state + self.layer_bias[layer_id]
 
         reg_output = self.reg_branches[layer_id](hidden_state)
         # Output-space residual on the temporal prior (Track C). With the final

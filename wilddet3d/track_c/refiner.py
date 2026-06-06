@@ -40,10 +40,14 @@ class TrackCRefiner(nn.Module):
         reg_residual_from_prior: bool = True,
         box_coder: Optional[Det3DCoder] = None,
         depth_latent_dim: int = 256,
+        use_temporal_modules: bool = True,
+        use_layer_bias: bool = False,
     ) -> None:
         super().__init__()
         self.coder = box_coder or Det3DCoder()
         self.reg_residual_from_prior = reg_residual_from_prior
+        self.use_temporal_modules = use_temporal_modules
+        self.use_layer_bias = use_layer_bias
         # num_pred_layer = num_decoder_layer + 1 (as_two_stage); we feed the L
         # decoder layers we actually have (6) -> head uses pred layers 0..L-1.
         self.head = Det3DHead(
@@ -52,12 +56,16 @@ class TrackCRefiner(nn.Module):
             depth_latent_dim=depth_latent_dim,
             use_camera_prompt=True,
             use_depth_prompt=True,
-            use_temporal_prompt=True,
+            use_temporal_prompt=use_temporal_modules,
             traj_token_dim=traj_token_dim,
+            use_layer_bias=use_layer_bias,
         )
-        self.traj_encoder = TrajectoryEncoder(
-            embed_dims=traj_token_dim, num_layers=traj_layers
-        )
+        if use_temporal_modules:
+            self.traj_encoder = TrajectoryEncoder(
+                embed_dims=traj_token_dim, num_layers=traj_layers
+            )
+        else:
+            self.traj_encoder = None
 
     # ---- pretrained-head loading -------------------------------------------
     def load_pretrained_head(self, checkpoint_path: str, map_location="cpu") -> dict:
@@ -125,25 +133,26 @@ class TrackCRefiner(nn.Module):
         input_hw,
     ) -> dict:
         T = box_repr.shape[0]
-        tokens, box_out = self.traj_encoder(
-            box_repr.unsqueeze(0), timestamps.unsqueeze(0), measured_mask.unsqueeze(0)
-        )                                            # [1,T,256], [1,T,12]
-        tokens = tokens[0]                           # [T,256]
-        box_out = box_out[0]                         # [T,12] temporal-aware abs box
+        if self.use_temporal_modules:
+            tokens, box_out = self.traj_encoder(
+                box_repr.unsqueeze(0), timestamps.unsqueeze(0), measured_mask.unsqueeze(0)
+            )                                        # [1,T,256], [1,T,12]
+            tokens = tokens[0]; box_out = box_out[0]
+            base_box = box_out
+        else:
+            tokens = None
+            box_out = None
+            # without the encoder, the residual base is just the (interpolated)
+            # input prior at each frame
+            base_box = box_repr
 
-        # The temporal box is the output-space anchor; compute its 12-d encoding
-        # (projection geometry) in fp32 even under bf16 autocast, so the box
-        # center isn't perturbed by bf16 rounding.
         with torch.autocast(device_type="cuda", enabled=False):
             temporal_box_12d = self.encode_temporal_box_12d(
-                box_out.float(), pred_box_2d.float(), intrinsics.float(), input_hw
-            )                                        # [T,12] coder space (fp32)
+                base_box.float(), pred_box_2d.float(), intrinsics.float(), input_hw
+            )
 
         # head batch = T frames, S=1 query each
-        temporal_tokens = tokens.unsqueeze(1)        # [T,1,256]
-        # residual-from-prior: add the temporal box as the output base (reg is
-        # zero-init). residual-from-pretrained: no additive base (keep pretrained
-        # reg as the anchor), temporal info flows only via the gated prompt.
+        temporal_tokens = tokens.unsqueeze(1) if tokens is not None else None
         temporal_box_in = (temporal_box_12d.unsqueeze(1)
                            if self.reg_residual_from_prior else None)
         stacked_reg, stacked_conf = self.head(
@@ -208,22 +217,38 @@ class TrackCRefiner(nn.Module):
         Valid (non-pad) frames in row-major (k, t) order match the concatenated
         head inputs, so ``tokens[~pad_mask]`` aligns with them.
         """
-        tokens, box_out = self.traj_encoder(
-            batch["box_repr"], batch["ts"], batch["measured"],
-            key_padding_mask=batch["pad_mask"])          # [K,Tmax,256], [K,Tmax,12]
         valid = ~batch["pad_mask"]                       # [K,Tmax]
-        tokens_v = tokens[valid]                         # [sum_T, 256]
-        box_out_v = box_out[valid]                       # [sum_T, 12]
-        with torch.autocast(device_type="cuda", enabled=False):
-            temporal_box_12d = self.encode_temporal_box_12d(
-                box_out_v.float(), batch["box2d"].float(), batch["K"].float(),
-                batch["input_hw"])                       # [sum_T, 12] (per-frame K, fp32)
-        temporal_box_in = (temporal_box_12d.unsqueeze(1)
-                           if self.reg_residual_from_prior else None)
+        if self.use_temporal_modules:
+            tokens, box_out = self.traj_encoder(
+                batch["box_repr"], batch["ts"], batch["measured"],
+                key_padding_mask=batch["pad_mask"])      # [K,Tmax,256], [K,Tmax,12]
+            tokens_v = tokens[valid]                     # [sum_T, 256]
+            box_out_v = box_out[valid]                   # [sum_T, 12]
+            with torch.autocast(device_type="cuda", enabled=False):
+                temporal_box_12d = self.encode_temporal_box_12d(
+                    box_out_v.float(), batch["box2d"].float(), batch["K"].float(),
+                    batch["input_hw"])                   # [sum_T, 12] per-frame K
+            temporal_tokens_in = tokens_v.unsqueeze(1)
+            temporal_box_in = (temporal_box_12d.unsqueeze(1)
+                               if self.reg_residual_from_prior else None)
+        else:
+            # No trajectory encoder. If residual-from-prior is on, anchor on the
+            # raw (interpolated) box_repr at each frame — no temporal smoothing,
+            # just the same Step-4 prior. Otherwise pass nothing.
+            tokens_v = None; box_out_v = None
+            temporal_tokens_in = None; temporal_box_12d = None; temporal_box_in = None
+            if self.reg_residual_from_prior:
+                br_v = batch["box_repr"][valid]          # [sum_T, 12] abs cam
+                with torch.autocast(device_type="cuda", enabled=False):
+                    temporal_box_12d = self.encode_temporal_box_12d(
+                        br_v.float(), batch["box2d"].float(),
+                        batch["K"].float(), batch["input_hw"])
+                temporal_box_in = temporal_box_12d.unsqueeze(1)
+
         stacked_reg, stacked_conf = self.head(
             hidden_states=batch["hidden"], ray_embeddings=batch["ray"],
             depth_latents=batch["depth"],
-            temporal_tokens=tokens_v.unsqueeze(1),
+            temporal_tokens=temporal_tokens_in,
             temporal_box_12d=temporal_box_in,
         )                                                # [L, sum_T, 1, 12]
         return {"reg": stacked_reg, "conf": stacked_conf,

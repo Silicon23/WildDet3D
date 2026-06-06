@@ -113,9 +113,10 @@ def evaluate(refiner, loader, dev):
         # input prior
         c, d, R = _box_repr_to_cdr(pack["box_repr"])
         srcs = {"input": (c, d, R)}
-        # trajectory-encoder box
-        c2, d2, R2 = _box_repr_to_cdr(out["traj_box_out"])
-        srcs["traj_enc"] = (c2, d2, R2)
+        # trajectory-encoder box (only present when modules are active)
+        if out.get("traj_box_out") is not None:
+            c2, d2, R2 = _box_repr_to_cdr(out["traj_box_out"])
+            srcs["traj_enc"] = (c2, d2, R2)
         # track C decoded final layer
         dec = refiner.decode_layer(out["reg"][-1, :, 0, :], pack["box2d"], pack["K"], pack["input_hw"])
         cc, dd = dec[:, 0:3], dec[:, 3:6]
@@ -162,6 +163,12 @@ def main():
     ap.add_argument("--no_temporal", type=int, default=0,
                     help="ablation: freeze the temporal-prompt gate at 0 (no "
                          "temporal cross-attention; pure per-frame image grounding)")
+    ap.add_argument("--no_traj_encoder", type=int, default=0,
+                    help="v11: physically remove TrajectoryEncoder + prompt_temporal "
+                         "(use_temporal_modules=False). Modules are not allocated.")
+    ap.add_argument("--use_layer_bias", type=int, default=0,
+                    help="v11_with_bias: add a per-layer learned bias (256-d) to "
+                         "the head, replacing the collapsed temporal feature cheaply.")
     ap.add_argument("--w_center", type=float, default=1.0)
     ap.add_argument("--w_depth", type=float, default=1.0)
     ap.add_argument("--w_dims", type=float, default=1.0)
@@ -196,11 +203,15 @@ def main():
     train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=None, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=None, num_workers=0)
 
-    refiner = TrackCRefiner(reg_residual_from_prior=bool(args.reg_residual_from_prior)).to(dev)
+    refiner = TrackCRefiner(
+        reg_residual_from_prior=bool(args.reg_residual_from_prior),
+        use_temporal_modules=not bool(args.no_traj_encoder),
+        use_layer_bias=bool(args.use_layer_bias),
+    ).to(dev)
     info = refiner.load_pretrained_head(args.ckpt)
     print(f"[build] head load: {info['loaded']} tensors, new={len(info['missing'])}", flush=True)
     refiner.finalize_init()
-    if args.no_temporal:
+    if args.no_temporal and refiner.head.temporal_gate is not None:
         for g in refiner.head.temporal_gate:
             g.data.zero_()
             g.requires_grad_(False)
@@ -214,14 +225,14 @@ def main():
         if not p.requires_grad:
             continue
         if ("temporal_gate" in name or "prompt_temporal" in name
-                or "project_temporal" in name):
+                or "project_temporal" in name or "layer_bias" in name):
             temporal_params.append(p)
         else:
             base_params.append(p)
-    opt = torch.optim.AdamW([
-        {"params": base_params, "lr": args.lr},
-        {"params": temporal_params, "lr": args.lr * args.gate_lr_mult},
-    ], weight_decay=1e-4)
+    pg = [{"params": base_params, "lr": args.lr}]
+    if temporal_params:
+        pg.append({"params": temporal_params, "lr": args.lr * args.gate_lr_mult})
+    opt = torch.optim.AdamW(pg, weight_decay=1e-4)
     print(f"[build] param groups: base={sum(p.numel() for p in base_params)/1e6:.2f}M "
           f"temporal={sum(p.numel() for p in temporal_params)/1e6:.2f}M "
           f"(temporal lr x{args.gate_lr_mult})", flush=True)
@@ -280,8 +291,11 @@ def main():
         dt = time.time() - t0
         # mean over the USED prediction layers (exclude the last clone, which the
         # 6-decoder-layer forward never invokes, so it stays at its zero init).
-        gate = torch.stack([g.abs().mean()
-                            for g in refiner.head.temporal_gate[:-1]]).mean().item()
+        if refiner.head.temporal_gate is not None:
+            gate = torch.stack([g.abs().mean()
+                                for g in refiner.head.temporal_gate[:-1]]).mean().item()
+        else:
+            gate = 0.0
         dstr = ""
         if dlogs is not None:
             dstr = (f" deriv(cvel={float(dlogs['d_center_vel']):.3f} "
