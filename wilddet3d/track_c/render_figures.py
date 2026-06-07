@@ -40,60 +40,78 @@ RUNS = Path("/weka/oe-training-default/weikaih/3d_boundingbox_detection/"
 # ---------- Fig 2: accuracy <-> smoothness trade-off ----------
 def render_tradeoff():
     # Pareto-frontier data points from the App H weight sweep (834-traj held-out).
-    # (label, w_vel, w_acc, w_rotvel, iou3d, rot_jit_deg)
+    # The "chosen" entry is v11 (modules removed, same weights as the rest).
+    # (key, w_vel, w_acc, w_rotvel, iou3d, rot_jit_deg)
     points = [
         ("none",       0.00, 0.00, 0.00, 0.230, 6.72),
         ("half",       0.05, 0.05, 0.15, 0.237, 4.30),
-        ("chosen",     0.10, 0.10, 0.30, 0.234, 3.47),
+        ("chosen",     0.10, 0.10, 0.30, 0.233, 3.43),
         ("between",    0.15, 0.15, 0.60, 0.228, 2.43),
         ("moderate",   0.30, 0.30, 1.00, 0.201, 1.67),
-        # strong (2,2,5) over-smooths: rot_deg 33.1, rot_jit not measured.
-        # We omit it from the scatter and call it out as a banner.
+        # strong (2,2,5) over-smooths to IoU 0.131; not on the curve.
     ]
     gt_floor_rot_jit = 0.63
     fig, ax = plt.subplots(figsize=(4.6, 3.4))
 
     iou = np.array([p[4] for p in points])
     jit = np.array([p[5] for p in points])
-    labels = [p[0] for p in points]
+    keys = [p[0] for p in points]
 
     # Frontier line
     order = np.argsort(jit)
     ax.plot(jit[order], iou[order], "-", color="#7c8794", lw=1.0, zorder=1)
-    # Scatter
-    ax.scatter(jit, iou, s=42, c="#3463bf", edgecolors="white", linewidths=0.8, zorder=3)
-    # Mark chosen
-    ci = labels.index("chosen")
-    ax.scatter([jit[ci]], [iou[ci]], s=130, marker="*", c="#d35400",
-               edgecolors="white", linewidths=0.8, zorder=4, label="chosen (reported)")
-    # Annotate each point (offsets chosen to avoid label collisions)
-    nudges = {"none": (8, -10), "half": (-2, 8), "chosen": (8, -2),
-              "between": (-12, 10), "moderate": (8, 4)}
-    aligns = {"none": ("left", "top"), "half": ("center", "bottom"),
-              "chosen": ("left", "center"), "between": ("right", "bottom"),
-              "moderate": ("left", "center")}
-    for j, ii, lab in zip(jit, iou, labels):
-        ha, va = aligns[lab]
-        ax.annotate(lab, (j, ii), xytext=nudges[lab], textcoords="offset points",
-                    fontsize=8, color="#1c2833", ha=ha, va=va)
+    # Scatter (skip the chosen point; it gets a star)
+    mask_non_chosen = [k != "chosen" for k in keys]
+    ax.scatter(jit[mask_non_chosen], iou[mask_non_chosen],
+               s=42, c="#3463bf", edgecolors="white", linewidths=0.8, zorder=3)
+    # Mark chosen ON the curve with a star
+    ci = keys.index("chosen")
+    ax.scatter([jit[ci]], [iou[ci]], s=170, marker="*", c="#d35400",
+               edgecolors="white", linewidths=0.8, zorder=4,
+               label="chosen (reported)")
+    # Annotate every point with its (w_vel, w_acc, w_rot-vel) triple.
+    # Offsets chosen to keep labels off the curve and out of each other.
+    label_for = {
+        "none":     r"$(0,0,0)$",
+        "half":     r"$(0.05,0.05,0.15)$",
+        "chosen":   r"$(0.1,0.1,0.3)$",
+        "between":  r"$(0.15,0.15,0.6)$",
+        "moderate": r"$(0.3,0.3,1.0)$",
+    }
+    nudges = {"none":     ( 8,  4),
+              "half":     ( 4, 10),
+              "chosen":   ( 8, -2),
+              "between":  ( 0, -14),
+              "moderate": ( 8,  4)}
+    aligns = {"none":     ("left",  "bottom"),
+              "half":     ("left",  "bottom"),
+              "chosen":   ("left",  "center"),
+              "between":  ("center", "top"),
+              "moderate": ("left",  "center")}
+    for k, j, ii in zip(keys, jit, iou):
+        ha, va = aligns[k]
+        ax.annotate(label_for[k], (j, ii), xytext=nudges[k],
+                    textcoords="offset points", fontsize=7.5,
+                    color="#1c2833", ha=ha, va=va)
     # GT-floor line
     ax.axvline(gt_floor_rot_jit, color="#27ae60", ls="--", lw=1, alpha=0.7)
-    ax.text(gt_floor_rot_jit * 1.10, 0.155, "GT jitter floor",
+    ax.text(gt_floor_rot_jit * 1.10, 0.187, "GT jitter floor",
             color="#1e7e34", fontsize=8, rotation=90, va="bottom")
-    # Note about over-smoothing regime (top-left)
-    ax.text(0.02, 0.04,
+    # Note about over-smoothing regime (top-left, won't collide with anything)
+    ax.text(0.02, 0.96,
             r"$(2,2,5)\!\to\!$ over-smooths, IoU3D 0.131",
-            transform=ax.transAxes, ha="left", va="bottom",
+            transform=ax.transAxes, ha="left", va="top",
             fontsize=7.5, color="#566573",
             bbox=dict(boxstyle="round,pad=0.25", fc="#fdfdfc", ec="#cccccc", lw=0.5))
 
     ax.set_xscale("log")
     ax.set_xlabel(r"rotation jitter (deg, log scale) $\downarrow$")
     ax.set_ylabel(r"held-out IoU3D $\uparrow$")
-    ax.set_xlim(0.5, 9.0)
-    ax.set_ylim(0.18, 0.255)
+    ax.set_xlim(0.5, 12.0)
+    ax.set_ylim(0.18, 0.248)
     ax.grid(True, which="both", alpha=0.25, lw=0.5)
-    ax.legend(loc="upper right", frameon=False)
+    # Caption legend: just identify the chosen-point marker.
+    ax.legend(loc="lower right", frameon=False, handletextpad=0.4)
     fig.savefig(OUT_DIR / "tradeoff.pdf")
     plt.close(fig)
     print(f"wrote {OUT_DIR/'tradeoff.pdf'}")
