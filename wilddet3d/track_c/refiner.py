@@ -43,12 +43,14 @@ class TrackCRefiner(nn.Module):
         use_temporal_modules: bool = True,
         use_layer_bias: bool = False,
         use_temporal_kv_norm: bool = False,
+        temporal_multi_token: bool = False,
     ) -> None:
         super().__init__()
         self.coder = box_coder or Det3DCoder()
         self.reg_residual_from_prior = reg_residual_from_prior
         self.use_temporal_modules = use_temporal_modules
         self.use_layer_bias = use_layer_bias
+        self.temporal_multi_token = use_temporal_modules and temporal_multi_token
         # num_pred_layer = num_decoder_layer + 1 (as_two_stage); we feed the L
         # decoder layers we actually have (6) -> head uses pred layers 0..L-1.
         self.head = Det3DHead(
@@ -61,6 +63,7 @@ class TrackCRefiner(nn.Module):
             traj_token_dim=traj_token_dim,
             use_layer_bias=use_layer_bias,
             use_temporal_kv_norm=use_temporal_kv_norm,
+            temporal_multi_token=temporal_multi_token,
         )
         if use_temporal_modules:
             self.traj_encoder = TrajectoryEncoder(
@@ -141,15 +144,22 @@ class TrackCRefiner(nn.Module):
         input_hw,
     ) -> dict:
         T = box_repr.shape[0]
+        temporal_pe = None
+        temporal_attn_mask = None  # single trajectory -> all frames attend each other
         if self.use_temporal_modules:
-            tokens, box_out = self.traj_encoder(
+            tok, box_out_b = self.traj_encoder(
                 box_repr.unsqueeze(0), timestamps.unsqueeze(0), measured_mask.unsqueeze(0)
             )                                        # [1,T,256], [1,T,12]
-            tokens = tokens[0]; box_out = box_out[0]
+            box_out = box_out_b[0]                   # [T,12]
             base_box = box_out
+            if self.temporal_multi_token:
+                temporal_tokens = tok                # [1,T,256] (frames as sequence)
+                temporal_pe = self.traj_encoder.time_pe(timestamps.unsqueeze(0))  # [1,T,256]
+            else:
+                temporal_tokens = tok[0].unsqueeze(1)  # [T,1,256]
         else:
-            tokens = None
             box_out = None
+            temporal_tokens = None
             # without the encoder, the residual base is just the (interpolated)
             # input prior at each frame
             base_box = box_repr
@@ -159,8 +169,6 @@ class TrackCRefiner(nn.Module):
                 base_box.float(), pred_box_2d.float(), intrinsics.float(), input_hw
             )
 
-        # head batch = T frames, S=1 query each
-        temporal_tokens = tokens.unsqueeze(1) if tokens is not None else None
         temporal_box_in = (temporal_box_12d.unsqueeze(1)
                            if self.reg_residual_from_prior else None)
         stacked_reg, stacked_conf = self.head(
@@ -169,6 +177,8 @@ class TrackCRefiner(nn.Module):
             depth_latents=depth_latents,
             temporal_tokens=temporal_tokens,
             temporal_box_12d=temporal_box_in,
+            temporal_pe=temporal_pe,
+            temporal_attn_mask=temporal_attn_mask,
         )                                            # [L,T,1,12], [L,T,1,1]
         return {
             "reg": stacked_reg,                      # [L,T,1,12] coder-encoded
@@ -226,6 +236,8 @@ class TrackCRefiner(nn.Module):
         head inputs, so ``tokens[~pad_mask]`` aligns with them.
         """
         valid = ~batch["pad_mask"]                       # [K,Tmax]
+        temporal_pe = None
+        temporal_attn_mask = None
         if self.use_temporal_modules:
             tokens, box_out = self.traj_encoder(
                 batch["box_repr"], batch["ts"], batch["measured"],
@@ -236,9 +248,23 @@ class TrackCRefiner(nn.Module):
                 temporal_box_12d = self.encode_temporal_box_12d(
                     box_out_v.float(), batch["box2d"].float(), batch["K"].float(),
                     batch["input_hw"])                   # [sum_T, 12] per-frame K
-            temporal_tokens_in = tokens_v.unsqueeze(1)
             temporal_box_in = (temporal_box_12d.unsqueeze(1)
                                if self.reg_residual_from_prior else None)
+            if self.temporal_multi_token:
+                # Flavor 2: per-frame query attends the whole (within-object)
+                # timeline. tokens [1, sum_T, 256]; timestamp PE per frame
+                # (computed per-trajectory so each has its own time origin);
+                # block-diagonal attn_mask so frames only see their own object.
+                temporal_tokens_in = tokens_v.unsqueeze(0)          # [1, sum_T, 256]
+                pe_pad = self.traj_encoder.time_pe(batch["ts"])     # [K, Tmax, 256]
+                temporal_pe = pe_pad[valid].unsqueeze(0)            # [1, sum_T, 256]
+                sizes = valid.sum(dim=1)                            # [K]
+                traj_id = torch.repeat_interleave(
+                    torch.arange(valid.shape[0], device=valid.device), sizes
+                )                                                  # [sum_T]
+                temporal_attn_mask = traj_id[:, None] != traj_id[None, :]  # [sum_T,sum_T] True=block
+            else:
+                temporal_tokens_in = tokens_v.unsqueeze(1)         # [sum_T, 1, 256]
         else:
             # No trajectory encoder. If residual-from-prior is on, anchor on the
             # raw (interpolated) box_repr at each frame — no temporal smoothing,
@@ -258,6 +284,8 @@ class TrackCRefiner(nn.Module):
             depth_latents=batch["depth"],
             temporal_tokens=temporal_tokens_in,
             temporal_box_12d=temporal_box_in,
+            temporal_pe=temporal_pe,
+            temporal_attn_mask=temporal_attn_mask,
         )                                                # [L, sum_T, 1, 12]
         return {"reg": stacked_reg, "conf": stacked_conf,
                 "box_out": box_out_v, "temporal_box_12d": temporal_box_12d}

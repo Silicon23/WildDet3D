@@ -77,6 +77,7 @@ class Det3DHead(nn.Module):
         traj_token_dim: int = 256,
         use_layer_bias: bool = False,
         use_temporal_kv_norm: bool = False,
+        temporal_multi_token: bool = False,
     ) -> None:
         """Initialize the 3D detection head.
 
@@ -100,6 +101,7 @@ class Det3DHead(nn.Module):
         self.use_temporal_prompt = use_temporal_prompt
         self.use_layer_bias = use_layer_bias
         self.use_temporal_kv_norm = use_temporal_kv_norm
+        self.temporal_multi_token = use_temporal_prompt and temporal_multi_token
 
         self.num_pred_layer = (
             num_decoder_layer + 1 if as_two_stage else num_decoder_layer
@@ -308,6 +310,8 @@ class Det3DHead(nn.Module):
         depth_latents: Tensor | None = None,
         temporal_tokens: Tensor | None = None,
         temporal_box_12d: Tensor | None = None,
+        temporal_pe: Tensor | None = None,
+        temporal_attn_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Single layer forward pass of the 3D detection head.
 
@@ -344,12 +348,29 @@ class Det3DHead(nn.Module):
 
         # Temporal-aware 3D queries (Track C). Zero-init gate -> identity at init.
         if self.use_temporal_prompt and temporal_tokens is not None:
-            proj_temporal = self.project_temporal[layer_id](temporal_tokens)
-            if self.temporal_kv_norm is not None:
-                proj_temporal = self.temporal_kv_norm[layer_id](proj_temporal)
-            updated = self.prompt_temporal[layer_id](
-                hidden_state, proj_temporal, proj_temporal
-            )
+            if self.temporal_multi_token:
+                # Flavor 2: the per-frame query attends over the WHOLE trajectory
+                # of temporal tokens (within-object, via the block-diagonal
+                # attn_mask), positioned by a timestamp PE on query and key.
+                # hidden_state [sum_T, 1, C] -> query [1, sum_T, C].
+                q = hidden_state.transpose(0, 1)                  # [1, sum_T, C]
+                proj_temporal = self.project_temporal[layer_id](temporal_tokens)  # [1, sum_T, C]
+                if self.temporal_kv_norm is not None:
+                    proj_temporal = self.temporal_kv_norm[layer_id](proj_temporal)
+                upd = self.prompt_temporal[layer_id](
+                    q, proj_temporal, proj_temporal,
+                    query_pos=temporal_pe, key_pos=temporal_pe,
+                    attn_mask=temporal_attn_mask,
+                )                                                 # [1, sum_T, C]
+                updated = upd.transpose(0, 1)                     # [sum_T, 1, C]
+            else:
+                # Flavor 1: single token per frame (n_tok=1), degenerate cross-attn.
+                proj_temporal = self.project_temporal[layer_id](temporal_tokens)
+                if self.temporal_kv_norm is not None:
+                    proj_temporal = self.temporal_kv_norm[layer_id](proj_temporal)
+                updated = self.prompt_temporal[layer_id](
+                    hidden_state, proj_temporal, proj_temporal
+                )
             hidden_state = hidden_state + self.temporal_gate[layer_id] * (
                 updated - hidden_state
             )
@@ -376,6 +397,8 @@ class Det3DHead(nn.Module):
         depth_latents: Tensor | None = None,
         temporal_tokens: Tensor | None = None,
         temporal_box_12d: Tensor | None = None,
+        temporal_pe: Tensor | None = None,
+        temporal_attn_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Forward pass of the 3D detection head.
 
@@ -406,6 +429,8 @@ class Det3DHead(nn.Module):
                 depth_latents,
                 temporal_tokens=temporal_tokens,
                 temporal_box_12d=temporal_box_12d,
+                temporal_pe=temporal_pe,
+                temporal_attn_mask=temporal_attn_mask,
             )
 
             all_layers_outputs_3d.append(reg_output)
@@ -442,15 +467,25 @@ class Prompt3DQueryLayer(nn.Module):
         key: Tensor,
         value: Tensor,
         query_pos: Tensor | None = None,
+        key_pos: Tensor | None = None,
+        attn_mask: Tensor | None = None,
+        key_padding_mask: Tensor | None = None,
     ) -> Tensor:
-        """Forward."""
-        # self attention
+        """Forward.
+
+        ``key_pos`` / ``attn_mask`` / ``key_padding_mask`` default to None, so
+        the per-frame ray/depth prompts (which pass none of them) are unchanged.
+        Track C Flavor 2 supplies a timestamp ``query_pos``/``key_pos`` and a
+        within-trajectory ``attn_mask`` so the query attends over the timeline.
+        """
+        # self attention (over the query set; masked + positioned in Flavor 2)
         query = self.self_attn(
             query=query,
             key=query,
             value=query,
             query_pos=query_pos,
             key_pos=query_pos,
+            attn_mask=attn_mask,
         )
         query = self.norm1(query)
 
@@ -460,6 +495,9 @@ class Prompt3DQueryLayer(nn.Module):
             key=key,
             value=value,
             query_pos=query_pos,
+            key_pos=key_pos if key_pos is not None else query_pos,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
         )
         query = self.norm2(query)
 

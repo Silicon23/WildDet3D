@@ -175,6 +175,10 @@ def main():
     ap.add_argument("--warm_start_temporal", type=int, default=0,
                     help="scale-fix: init project_temporal/prompt_temporal from the "
                          "pretrained depth branch instead of from scratch.")
+    ap.add_argument("--temporal_multi_token", type=int, default=0,
+                    help="Flavor 2: per-frame query attends the whole within-object "
+                         "timeline of temporal tokens (timestamp PE on q+k, block-diagonal "
+                         "mask) instead of a single token. Breaks the single-key degeneracy.")
     ap.add_argument("--w_center", type=float, default=1.0)
     ap.add_argument("--w_depth", type=float, default=1.0)
     ap.add_argument("--w_dims", type=float, default=1.0)
@@ -214,6 +218,7 @@ def main():
         use_temporal_modules=not bool(args.no_traj_encoder),
         use_layer_bias=bool(args.use_layer_bias),
         use_temporal_kv_norm=bool(args.temporal_kv_norm),
+        temporal_multi_token=bool(args.temporal_multi_token),
     ).to(dev)
     info = refiner.load_pretrained_head(args.ckpt)
     print(f"[build] head load: {info['loaded']} tensors, new={len(info['missing'])}", flush=True)
