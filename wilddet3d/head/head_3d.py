@@ -76,6 +76,7 @@ class Det3DHead(nn.Module):
         use_temporal_prompt: bool = False,
         traj_token_dim: int = 256,
         use_layer_bias: bool = False,
+        use_temporal_kv_norm: bool = False,
     ) -> None:
         """Initialize the 3D detection head.
 
@@ -98,6 +99,7 @@ class Det3DHead(nn.Module):
         self.use_depth_prompt = use_depth_prompt
         self.use_temporal_prompt = use_temporal_prompt
         self.use_layer_bias = use_layer_bias
+        self.use_temporal_kv_norm = use_temporal_kv_norm
 
         self.num_pred_layer = (
             num_decoder_layer + 1 if as_two_stage else num_decoder_layer
@@ -158,10 +160,22 @@ class Det3DHead(nn.Module):
                     for _ in range(self.num_pred_layer)
                 ]
             )
+            # Optional LayerNorm on the projected temporal KV before the cross-
+            # attn. The project_* MLP normalizes its INPUT but not its OUTPUT;
+            # the from-scratch temporal projection can drift to a ~100x-too-large
+            # KV scale vs the pretrained depth/ray KVs. This LN guarantees a
+            # well-conditioned, unit-scale KV regardless of the learned weights.
+            if self.use_temporal_kv_norm:
+                self.temporal_kv_norm = nn.ModuleList(
+                    [nn.LayerNorm(embed_dims) for _ in range(self.num_pred_layer)]
+                )
+            else:
+                self.temporal_kv_norm = None
         else:
             self.project_temporal = None
             self.prompt_temporal = None
             self.temporal_gate = None
+            self.temporal_kv_norm = None
 
         # Per-layer learned additive bias (Track C v11_with_bias). Tests the
         # "constant feature" hypothesis: replace the prompt_temporal collapse
@@ -231,6 +245,29 @@ class Det3DHead(nn.Module):
         for m in self.reg_branches:
             nn.init.zeros_(m[-1].weight)
             nn.init.zeros_(m[-1].bias)
+
+    def warm_start_temporal_from_depth(self) -> None:
+        """Initialize the temporal prompt branch from the pretrained depth branch.
+
+        ``project_temporal``/``prompt_temporal`` are structurally identical to
+        ``project_depth``/``prompt_depth`` (both ``MLP(256->1024->256)`` +
+        ``Prompt3DQueryLayer(256)``). Copying the pretrained depth weights gives
+        the otherwise-from-scratch temporal branch a well-conditioned starting
+        point (sub-unit projected KV) instead of letting it drift into the
+        ~100x-too-large KV regime. The zero-init ``temporal_gate`` still makes
+        the branch identity-at-init; this only sets where training starts from
+        once the gate opens. Call AFTER loading pretrained head weights.
+        """
+        assert self.use_temporal_prompt and self.use_depth_prompt, (
+            "warm-start needs both temporal and depth prompt branches"
+        )
+        for i in range(self.num_pred_layer):
+            self.project_temporal[i].load_state_dict(
+                self.project_depth[i].state_dict()
+            )
+            self.prompt_temporal[i].load_state_dict(
+                self.prompt_depth[i].state_dict()
+            )
 
     def get_camera_embeddings(
         self,
@@ -308,6 +345,8 @@ class Det3DHead(nn.Module):
         # Temporal-aware 3D queries (Track C). Zero-init gate -> identity at init.
         if self.use_temporal_prompt and temporal_tokens is not None:
             proj_temporal = self.project_temporal[layer_id](temporal_tokens)
+            if self.temporal_kv_norm is not None:
+                proj_temporal = self.temporal_kv_norm[layer_id](proj_temporal)
             updated = self.prompt_temporal[layer_id](
                 hidden_state, proj_temporal, proj_temporal
             )

@@ -169,6 +169,12 @@ def main():
     ap.add_argument("--use_layer_bias", type=int, default=0,
                     help="v11_with_bias: add a per-layer learned bias (256-d) to "
                          "the head, replacing the collapsed temporal feature cheaply.")
+    ap.add_argument("--temporal_kv_norm", type=int, default=0,
+                    help="scale-fix: LayerNorm the projected temporal KV before the "
+                         "cross-attn (caps the ~100x KV-scale drift of the from-scratch branch).")
+    ap.add_argument("--warm_start_temporal", type=int, default=0,
+                    help="scale-fix: init project_temporal/prompt_temporal from the "
+                         "pretrained depth branch instead of from scratch.")
     ap.add_argument("--w_center", type=float, default=1.0)
     ap.add_argument("--w_depth", type=float, default=1.0)
     ap.add_argument("--w_dims", type=float, default=1.0)
@@ -207,10 +213,14 @@ def main():
         reg_residual_from_prior=bool(args.reg_residual_from_prior),
         use_temporal_modules=not bool(args.no_traj_encoder),
         use_layer_bias=bool(args.use_layer_bias),
+        use_temporal_kv_norm=bool(args.temporal_kv_norm),
     ).to(dev)
     info = refiner.load_pretrained_head(args.ckpt)
     print(f"[build] head load: {info['loaded']} tensors, new={len(info['missing'])}", flush=True)
     refiner.finalize_init()
+    if args.warm_start_temporal:
+        refiner.warm_start_temporal_from_depth()
+        print("[build] warm-started temporal branch from pretrained depth branch", flush=True)
     if args.no_temporal and refiner.head.temporal_gate is not None:
         for g in refiner.head.temporal_gate:
             g.data.zero_()
@@ -225,7 +235,8 @@ def main():
         if not p.requires_grad:
             continue
         if ("temporal_gate" in name or "prompt_temporal" in name
-                or "project_temporal" in name or "layer_bias" in name):
+                or "project_temporal" in name or "temporal_kv_norm" in name
+                or "layer_bias" in name):
             temporal_params.append(p)
         else:
             base_params.append(p)

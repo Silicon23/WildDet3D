@@ -42,6 +42,7 @@ class TrackCRefiner(nn.Module):
         depth_latent_dim: int = 256,
         use_temporal_modules: bool = True,
         use_layer_bias: bool = False,
+        use_temporal_kv_norm: bool = False,
     ) -> None:
         super().__init__()
         self.coder = box_coder or Det3DCoder()
@@ -59,6 +60,7 @@ class TrackCRefiner(nn.Module):
             use_temporal_prompt=use_temporal_modules,
             traj_token_dim=traj_token_dim,
             use_layer_bias=use_layer_bias,
+            use_temporal_kv_norm=use_temporal_kv_norm,
         )
         if use_temporal_modules:
             self.traj_encoder = TrajectoryEncoder(
@@ -88,6 +90,12 @@ class TrackCRefiner(nn.Module):
         """Apply Track C init choices after loading pretrained head weights."""
         if self.reg_residual_from_prior:
             self.head.zero_init_reg_residual()
+
+    def warm_start_temporal_from_depth(self) -> None:
+        """Warm-start the temporal prompt branch from the pretrained depth
+        branch (scale-fix init). Call AFTER load_pretrained_head."""
+        if self.use_temporal_modules:
+            self.head.warm_start_temporal_from_depth()
 
     # ---- temporal box (abs cam) -> 12-d coder encoding ---------------------
     def encode_temporal_box_12d(
