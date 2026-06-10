@@ -43,6 +43,10 @@ def main():
                     help="v11: load a checkpoint trained without TrajectoryEncoder + prompt_temporal")
     ap.add_argument("--use_layer_bias", type=int, default=0,
                     help="v11_with_bias: load a checkpoint that adds per-layer learned bias")
+    ap.add_argument("--temporal_kv_norm", type=int, default=0,
+                    help="v14+: checkpoint has the projected-temporal-KV LayerNorm")
+    ap.add_argument("--temporal_multi_token", type=int, default=0,
+                    help="v15+: checkpoint uses the multi-token (Flavor 2) temporal cross-attn")
     ap.add_argument("--val_frac", type=float, default=0.08)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
@@ -56,6 +60,8 @@ def main():
         reg_residual_from_prior=bool(args.reg_residual_from_prior),
         use_temporal_modules=not bool(args.no_traj_encoder),
         use_layer_bias=bool(args.use_layer_bias),
+        use_temporal_kv_norm=bool(args.temporal_kv_norm),
+        temporal_multi_token=bool(args.temporal_multi_token),
     ).to(dev)
     sd = torch.load(args.ckpt, map_location="cpu", weights_only=False)["refiner"]
     refiner.load_state_dict(sd, strict=True)
