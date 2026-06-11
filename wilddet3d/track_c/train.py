@@ -38,6 +38,7 @@ from wilddet3d.track_c.dataset import (
     split_by_video,
 )
 from wilddet3d.track_c.losses import geodesic_rotation_loss
+from wilddet3d.track_c.smoothness_losses import pattern_smoothness_loss
 
 
 def to_dev(pack, dev):
@@ -189,6 +190,27 @@ def main():
                     help="GT-derivative match: center acceleration (2nd diff)")
     ap.add_argument("--w_rotvel", type=float, default=0.0,
                     help="GT-derivative match: angular velocity (deg, symmetry-aware) — the main smoothness term")
+    # --- pattern smoothness terms (trajectory_smoothness_losses.md, first wave) ---
+    ap.add_argument("--w_rotvel2", type=float, default=0.0,
+                    help="R2: UNFOLDED relative-rotation matching (chordal). Catches "
+                         "axis wobble + mid-track flips the folded w_rotvel cannot see.")
+    ap.add_argument("--rotvel2_form", default="chordal", choices=["chordal", "geodesic"])
+    ap.add_argument("--w_acc_hinge", type=float, default=0.0,
+                    help="L3h: ReLU(|acc_pred|-|acc_gt|-margin), linear in jitter amplitude")
+    ap.add_argument("--acc_hinge_margin", type=float, default=0.0)
+    ap.add_argument("--w_pos_flip", type=float, default=0.0,
+                    help="L5/L6: lag-k flip loss on center velocity deviation (scale-invariant)")
+    ap.add_argument("--w_rot_flip", type=float, default=0.0,
+                    help="L5/L6 on gated so(3) log-increment deviation")
+    ap.add_argument("--flip_lags", default="1,2", help="comma lags for the flip losses")
+    ap.add_argument("--pos_delta_mm", type=float, default=10.0,
+                    help="sqrt(delta) for position flip loss, mm/frame (noise-floor gate)")
+    ap.add_argument("--rot_delta_deg", type=float, default=0.05,
+                    help="sqrt(delta) for rotation flip loss, deg/frame")
+    ap.add_argument("--flip_margin", type=float, default=0.2)
+    ap.add_argument("--init_from", default="",
+                    help="warm-start the refiner from a previous run's best.pt "
+                         "(arch flags must match); use with few-epoch fine-tunes")
     ap.add_argument("--eval_every", type=int, default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit", type=int, default=0)
@@ -231,8 +253,14 @@ def main():
             g.data.zero_()
             g.requires_grad_(False)
         print("[build] no_temporal: temporal-prompt gates frozen at 0 (ablation)", flush=True)
+    if args.init_from:
+        sd = torch.load(args.init_from, map_location="cpu", weights_only=False)["refiner"]
+        refiner.load_state_dict(sd, strict=True)
+        print(f"[build] warm-started full refiner from {args.init_from}", flush=True)
 
     # Higher LR for the new temporal modules (esp. the zero-init LayerScale gate)
+    flip_lags = tuple(int(x) for x in str(args.flip_lags).split(",") if x.strip())
+
     # so the image-grounded temporal-prompt pathway activates from a cold start,
     # while preserving identity-at-init (gate starts at exactly 0).
     temporal_params, base_params = [], []
@@ -268,7 +296,7 @@ def main():
         refiner.train()
         train_sampler.set_epoch(ep)
         t0 = time.time()
-        running, nstep, logs, dlogs = 0.0, 0, None, None
+        running, nstep, logs, dlogs, plogs = 0.0, 0, None, None, None
         idxs = list(iter(train_sampler))
         opt.zero_grad()
         for bstart in range(0, len(idxs), K):
@@ -284,8 +312,10 @@ def main():
                 batch["gt_quat"], batch["box2d"], batch["K"], batch["input_hw"])
             loss = track_c_loss_from_targets(pred, target, weights, gt_R, valid, **loss_kw)
             total = loss["loss"]
-            dlog = None
-            if (args.w_vel + args.w_acc + args.w_rotvel) > 0:
+            dlog, plog = None, None
+            w_pattern = (args.w_rotvel2 + args.w_acc_hinge
+                         + args.w_pos_flip + args.w_rot_flip)
+            if (args.w_vel + args.w_acc + args.w_rotvel) > 0 or w_pattern > 0:
                 # decode final-layer boxes per trajectory (single K each) in fp32
                 reg_f = pred[-1]
                 off, pcs, pRs = 0, [], []
@@ -294,16 +324,32 @@ def main():
                     dec = refiner.decode_layer(reg_f[sl], batch["box2d"][sl],
                                                batch["K"][sl][0], batch["input_hw"])
                     pcs.append(dec[:, 0:3]); pRs.append(quaternion_to_matrix(dec[:, 6:10]))
-                dlog = derivative_matching_loss(
-                    torch.cat(pcs, 0), torch.cat(pRs, 0), batch["gt_center"], gt_R,
-                    batch["sizes"], valid, w_vel=args.w_vel, w_acc=args.w_acc,
-                    w_rotvel=args.w_rotvel)
-                total = total + dlog["loss"]
+                pc_all, pR_all = torch.cat(pcs, 0), torch.cat(pRs, 0)
+                if (args.w_vel + args.w_acc + args.w_rotvel) > 0:
+                    dlog = derivative_matching_loss(
+                        pc_all, pR_all, batch["gt_center"], gt_R,
+                        batch["sizes"], valid, w_vel=args.w_vel, w_acc=args.w_acc,
+                        w_rotvel=args.w_rotvel)
+                    total = total + dlog["loss"]
+                if w_pattern > 0:
+                    plog = pattern_smoothness_loss(
+                        pc_all, pR_all, batch["gt_center"], gt_R,
+                        batch["sizes"], valid,
+                        w_rotvel2=args.w_rotvel2, rotvel2_form=args.rotvel2_form,
+                        w_acc_hinge=args.w_acc_hinge,
+                        acc_hinge_margin=args.acc_hinge_margin,
+                        w_pos_flip=args.w_pos_flip, w_rot_flip=args.w_rot_flip,
+                        flip_lags=flip_lags,
+                        pos_delta=(args.pos_delta_mm * 1e-3) ** 2,
+                        rot_delta=math.radians(args.rot_delta_deg) ** 2,
+                        flip_margin=args.flip_margin)
+                    total = total + plog["loss"]
             total.backward()
             torch.nn.utils.clip_grad_norm_(
                 [p for p in refiner.parameters() if p.requires_grad], 5.0)
             opt.step(); sched.step(); opt.zero_grad()
             running += float(total); nstep += 1; logs = loss; dlogs = dlog
+            plogs = plog if plog is not None else plogs
         dt = time.time() - t0
         # mean over the USED prediction layers (exclude the last clone, which the
         # 6-decoder-layer forward never invokes, so it stays at its zero init).
@@ -317,6 +363,17 @@ def main():
             dstr = (f" deriv(cvel={float(dlogs['d_center_vel']):.3f} "
                     f"cacc={float(dlogs['d_center_acc']):.3f} "
                     f"rotvel_deg={float(dlogs['d_rot_vel_deg']):.2f})")
+        if plogs is not None:
+            keys = [k for k in ("loss_rotvel2", "loss_acc_hinge", "loss_pos_flip",
+                                "loss_rot_flip") if k in plogs]
+            mons = [k for k in ("pos_mon_lag1_cos", "pos_mon_lag1_active",
+                                "rot_mon_lag1_cos", "rot_mon_gate_pass",
+                                "mon_flip_rate", "mon_acc_hinge_active")
+                    if k in plogs]
+            dstr += (" pat(" + " ".join(f"{k.replace('loss_','')}={float(plogs[k]):.4f}"
+                                        for k in keys)
+                     + " | " + " ".join(f"{k.replace('_mon','')}={float(plogs[k]):.3f}"
+                                        for k in mons) + ")")
         print(f"[ep {ep}] train_loss={running/max(nstep,1):.4f} "
               f"(center={float(logs['loss_center']):.3f} depth={float(logs['loss_depth']):.3f} "
               f"dims={float(logs['loss_dims']):.3f} rot_deg={float(logs['loss_rot_deg']):.2f}){dstr} "
@@ -330,6 +387,8 @@ def main():
             rec.update(d_center_vel=float(dlogs['d_center_vel']),
                        d_center_acc=float(dlogs['d_center_acc']),
                        d_rot_vel_deg=float(dlogs['d_rot_vel_deg']))
+        if plogs is not None:
+            rec.update({k: float(v) for k, v in plogs.items() if k != "loss"})
         if (ep + 1) % args.eval_every == 0 or ep == args.epochs - 1:
             ev = evaluate(refiner, val_loader, dev)
             tc = ev["track_c"]; inp = ev["input"]
