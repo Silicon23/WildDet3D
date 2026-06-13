@@ -212,6 +212,10 @@ def main():
                     help="warm-start the refiner from a previous run's best.pt "
                          "(arch flags must match); use with few-epoch fine-tunes")
     ap.add_argument("--eval_every", type=int, default=1)
+    ap.add_argument("--auto_resume", type=int, default=1,
+                    help="if <out_dir>/resume.pt exists, restore full state "
+                         "(model+opt+sched+epoch+best+history) and continue — "
+                         "makes container/session restarts cheap")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
@@ -285,14 +289,25 @@ def main():
     loss_kw = dict(w_center=args.w_center, w_depth=args.w_depth,
                    w_dims=args.w_dims, w_rot=args.w_rot)
 
-    print("[eval] baseline (init / before training):", flush=True)
-    ev = evaluate(refiner, val_loader, dev)
-    print("  " + json.dumps(ev), flush=True)
-
     best = 1e9
     history = []
+    start_ep = 0
+    resume_path = f"{args.out_dir}/resume.pt"
+    if args.auto_resume and os.path.exists(resume_path):
+        ck = torch.load(resume_path, map_location=dev, weights_only=False)
+        refiner.load_state_dict(ck["refiner"])
+        opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        best = ck["best"]; history = ck["history"]; start_ep = ck["epoch"] + 1
+        print(f"[resume] restored from {resume_path}: continuing at epoch "
+              f"{start_ep}/{args.epochs} (best iou3d={-best:.4f})", flush=True)
+    else:
+        print("[eval] baseline (init / before training):", flush=True)
+        ev = evaluate(refiner, val_loader, dev)
+        print("  " + json.dumps(ev), flush=True)
+
     K = args.batch_trajs
-    for ep in range(args.epochs):
+    for ep in range(start_ep, args.epochs):
         refiner.train()
         train_sampler.set_epoch(ep)
         t0 = time.time()
@@ -407,6 +422,12 @@ def main():
         history.append(rec)
         with open(f"{args.out_dir}/history.json", "w") as f:
             json.dump(history, f, indent=1)
+        # full-state checkpoint for cheap resume after container/session restart
+        tmp = f"{args.out_dir}/resume.pt.tmp"
+        torch.save({"refiner": refiner.state_dict(), "opt": opt.state_dict(),
+                    "sched": sched.state_dict(), "epoch": ep, "best": best,
+                    "history": history, "args": vars(args)}, tmp)
+        os.replace(tmp, f"{args.out_dir}/resume.pt")
     torch.save({"refiner": refiner.state_dict(), "args": vars(args)},
                f"{args.out_dir}/last.pt")
     print("[train] done", flush=True)
