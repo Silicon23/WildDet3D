@@ -178,13 +178,24 @@ def main():
     ap.add_argument("--temporal_kv_norm", type=int, default=0)
     ap.add_argument("--temporal_multi_token", type=int, default=0)
     ap.add_argument("--val_frac", type=float, default=0.08)
+    ap.add_argument("--val_split_file", default=None,
+                    help="override CA-1M canonical split (pass Waymo/ADT split or '' for RNG)")
+    ap.add_argument("--categories", default="", help="comma list to keep; needs --pairing_index")
+    ap.add_argument("--pairing_index", default="")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", default="", help="write metrics JSON here")
     args = ap.parse_args()
     dev = args.device
 
     paths = list_cached_trajectories(args.cache_dir)
-    _, val_paths, _ = split_by_video(paths, args.val_frac)
+    if args.categories and args.pairing_index:
+        keep = set(c.strip() for c in args.categories.split(",") if c.strip())
+        cat_of = {}
+        for line in open(args.pairing_index):
+            d = json.loads(line); cat_of[f"{d['seg']}__{d['track_id']}"] = d["category"]
+        paths = [p for p in paths if cat_of.get(os.path.basename(p)[:-3]) in keep]
+    split_kw = {} if args.val_split_file is None else {"split_file": args.val_split_file}
+    _, val_paths, _ = split_by_video(paths, args.val_frac, **split_kw)
     ds = CachedTrackCDataset(args.cache_dir, val_paths, preload=True)
 
     refiner = TrackCRefiner(

@@ -14,19 +14,39 @@ from wilddet3d.ops.rotation import rotation_6d_to_matrix
 from wilddet3d.track_c import TrackCRefiner
 from wilddet3d.track_c.dataset import CachedTrackCDataset, list_cached_trajectories, split_by_video
 
+import os, json
 ap = argparse.ArgumentParser()
 ap.add_argument("--cache_dir", required=True)
 ap.add_argument("--ckpt", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--val_frac", type=float, default=0.08)
 ap.add_argument("--reg_residual_from_prior", type=int, default=0)
+ap.add_argument("--no_traj_encoder", type=int, default=0)
+ap.add_argument("--temporal_kv_norm", type=int, default=0)
+ap.add_argument("--temporal_multi_token", type=int, default=0)
+ap.add_argument("--use_layer_bias", type=int, default=0)
+ap.add_argument("--val_split_file", default=None, help="Waymo/ADT split override; ''=RNG")
+ap.add_argument("--categories", default="", help="comma list to keep; needs --pairing_index")
+ap.add_argument("--pairing_index", default="")
+ap.add_argument("--extrinsics_note", default="frame_index indexes Step-1 arrays per video")
 a = ap.parse_args()
 dev = "cuda"
 
 paths = list_cached_trajectories(a.cache_dir)
-_, val_paths, val_vids = split_by_video(paths, a.val_frac)
+if a.categories and a.pairing_index:
+    keep = set(c.strip() for c in a.categories.split(",") if c.strip())
+    cat_of = {}
+    for line in open(a.pairing_index):
+        d = json.loads(line); cat_of[f"{d['seg']}__{d['track_id']}"] = d["category"]
+    paths = [p for p in paths if cat_of.get(os.path.basename(p)[:-3]) in keep]
+split_kw = {} if a.val_split_file is None else {"split_file": a.val_split_file}
+_, val_paths, val_vids = split_by_video(paths, a.val_frac, **split_kw)
 ds = CachedTrackCDataset(a.cache_dir, val_paths, preload=True)
-r = TrackCRefiner(reg_residual_from_prior=bool(a.reg_residual_from_prior)).to(dev)
+r = TrackCRefiner(reg_residual_from_prior=bool(a.reg_residual_from_prior),
+                  use_temporal_modules=not bool(a.no_traj_encoder),
+                  use_layer_bias=bool(a.use_layer_bias),
+                  use_temporal_kv_norm=bool(a.temporal_kv_norm),
+                  temporal_multi_token=bool(a.temporal_multi_token)).to(dev)
 r.load_state_dict(torch.load(a.ckpt, map_location="cpu", weights_only=False)["refiner"], strict=True)
 r.eval()
 
@@ -59,5 +79,5 @@ with torch.no_grad():
         ))
 torch.save({"trajectories": out, "val_videos": val_vids,
             "source_ckpt": a.ckpt, "frame": "camera (OpenCV); R maps box-local->camera",
-            "note": "frame_index indexes Step-1 arrays (extrinsics/intrinsics/depth) per video"}, a.out)
+            "note": a.extrinsics_note}, a.out)
 print(f"dumped {len(out)} val trajectories -> {a.out}")
