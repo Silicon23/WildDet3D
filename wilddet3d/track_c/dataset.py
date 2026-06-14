@@ -107,6 +107,12 @@ class CachedTrackCDataset(Dataset):
     def video_of(self, i: int) -> str:
         return os.path.basename(self.traj_paths[i]).split("__")[0]
 
+    def traj_T(self, i: int) -> int:
+        """Number of frames in trajectory i (cheap; from RAM cache if preloaded)."""
+        if self.traj_cache is not None:
+            return int(self.traj_cache[i]["box_repr"].shape[0])
+        return int(torch.load(self.traj_paths[i], weights_only=False)["box_repr"].shape[0])
+
     def __getitem__(self, i: int) -> dict:
         traj = (self.traj_cache[i] if self.traj_cache is not None
                 else torch.load(self.traj_paths[i], weights_only=False))

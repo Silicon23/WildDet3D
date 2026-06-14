@@ -156,8 +156,21 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--accum", type=int, default=8, help="(unused in batched loop)")
     ap.add_argument("--batch_trajs", type=int, default=8,
-                    help="trajectories concatenated per batched head forward / step")
+                    help="MAX trajectories concatenated per batched head forward / step")
+    ap.add_argument("--max_frames_per_batch", type=int, default=360,
+                    help="cap total frames/batch (head forward concats all frames; "
+                         "guards OOM on long variable-length tracks). 360 = CA-1M's "
+                         "proven-safe max, so CA-1M batches stay K-limited (unchanged)")
     ap.add_argument("--val_frac", type=float, default=0.05)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="torch manual seed (model init + RNG split); vary for variance runs")
+    ap.add_argument("--val_split_file", default=None,
+                    help="path to a {val_video_ids:[...]} json; default=CA-1M canonical. "
+                         "Pass a Waymo/ADT split here, or '' to force RNG split by val_frac/seed")
+    ap.add_argument("--categories", default="",
+                    help="comma list to keep (e.g. 'vehicle'); needs --pairing_index. empty=all")
+    ap.add_argument("--pairing_index", default="",
+                    help="pairing_index.jsonl to map <seg>__<track> -> category for --categories")
     ap.add_argument("--gate_lr_mult", type=float, default=20.0,
                     help="LR multiplier for the new temporal modules (gate/prompt)")
     ap.add_argument("--reg_residual_from_prior", type=int, default=1)
@@ -222,10 +235,23 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     dev = args.device
 
+    torch.manual_seed(args.seed)
     paths = list_cached_trajectories(args.cache_dir)
+    if args.categories and args.pairing_index:
+        import json as _json
+        keep_cats = set(c.strip() for c in args.categories.split(",") if c.strip())
+        cat_of = {}
+        for line in open(args.pairing_index):
+            d = _json.loads(line)
+            cat_of[f"{d['seg']}__{d['track_id']}"] = d["category"]
+        paths = [p for p in paths
+                 if cat_of.get(os.path.basename(p)[:-3]) in keep_cats]
+        print(f"[data] category filter {keep_cats}: {len(paths)} trajs kept", flush=True)
     if args.limit:
         paths = paths[:args.limit]
-    train_paths, val_paths, val_vids = split_by_video(paths, args.val_frac)
+    split_kw = {} if args.val_split_file is None else {"split_file": args.val_split_file}
+    train_paths, val_paths, val_vids = split_by_video(
+        paths, args.val_frac, seed=args.seed, **split_kw)
     print(f"[data] {len(paths)} trajs -> train {len(train_paths)} / val {len(val_paths)} "
           f"({len(val_vids)} val videos)", flush=True)
 
@@ -314,8 +340,20 @@ def main():
         running, nstep, logs, dlogs, plogs = 0.0, 0, None, None, None
         idxs = list(iter(train_sampler))
         opt.zero_grad()
-        for bstart in range(0, len(idxs), K):
-            packs = [train_ds[i] for i in idxs[bstart:bstart + K]]
+        # Group into batches by a FRAME budget, not a fixed traj count: the head
+        # forward concatenates all frames in a batch, so memory scales with total
+        # frames. Variable-length tracks (Waymo up to ~199 vs CA-1M ~60) OOM at a
+        # fixed K. Cap total frames/batch (>=1 traj even if it alone exceeds).
+        groups, cur, cur_T = [], [], 0
+        for i in idxs:
+            Ti = int(train_ds.traj_T(i))
+            if cur and (len(cur) >= K or cur_T + Ti > args.max_frames_per_batch):
+                groups.append(cur); cur, cur_T = [], 0
+            cur.append(i); cur_T += Ti
+        if cur:
+            groups.append(cur)
+        for grp in groups:
+            packs = [train_ds[i] for i in grp]
             batch = to_dev(collate_trajs(packs), dev)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = refiner.forward_vectorized(batch)
