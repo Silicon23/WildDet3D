@@ -46,6 +46,25 @@ from wilddet3d.track_c.feature_extractor import FrozenFeatureExtractor
 from wilddet3d.track_c.precompute import _atomic_save
 
 
+def _lidar_depth_map(outputs_dir, seg, idx, H, W):
+    """Sparse GT-LiDAR depth map in METERS, matching WildDet3D's training format
+    (generate_waymo_depth_maps.py): zeros(H,W) with first-return points splatted,
+    0=invalid, keep-closer on pixel collisions. NO densification/interpolation.
+    Returns None if the npz is missing."""
+    p = f"{outputs_dir}/waymo_production/{seg}/gt/depth/{idx:06d}.npz"
+    if not os.path.exists(p):
+        return None
+    z = np.load(p)
+    u, v, d = z["u"].astype(np.int64), z["v"].astype(np.int64), z["z"].astype(np.float32)
+    m = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (d > 0)
+    u, v, d = u[m], v[m], d[m]
+    dm = np.zeros((H, W), dtype=np.float32)
+    # keep-closer: sort by descending depth so nearer points overwrite last
+    order = np.argsort(-d)
+    dm[v[order], u[order]] = d[order]
+    return dm
+
+
 def _mask_bbox_xyxy(rle_dict, h, w):
     """COCO RLE -> tight xyxy pixel bbox (+1px dilation), or None if empty."""
     rle = dict(rle_dict)
@@ -108,7 +127,8 @@ def _load_pairing_index(outputs_dir, path):
     return by_seg
 
 
-def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs=None):
+def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs=None,
+                       depth_source="vipe"):
     done_marker = f"{cache_dir}/.done/{seg}"
     if os.path.exists(done_marker):
         return {"seg": seg, "skipped": True}
@@ -174,8 +194,11 @@ def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs=
                 prompts.append(bb); kept.append(obj)
         if not prompts:
             continue
-        dpath = f"{depth_dir}/{idx:06d}.npy"
-        depth = np.load(dpath).astype(np.float32) if os.path.exists(dpath) else None
+        if depth_source == "lidar":
+            depth = _lidar_depth_map(outputs_dir, seg, idx, H, W)
+        else:
+            dpath = f"{depth_dir}/{idx:06d}.npy"
+            depth = np.load(dpath).astype(np.float32) if os.path.exists(dpath) else None
         K = (K_all[idx] if per_frame_K else K_all).astype(np.float32)
         feat = ext.extract(img, K, prompts, depth=depth)
 
@@ -246,6 +269,9 @@ def main():
     ap.add_argument("--pairing_index", default="",
                     help="pairing_index.jsonl: drive canonical track/frame set from it "
                          "(skip-frame logic baked in) instead of walking the tree")
+    ap.add_argument("--depth_source", default="vipe", choices=["vipe", "lidar"],
+                    help="vipe = step1_waymo ViPE depth (default); lidar = sparse GT-LiDAR "
+                         "splatted to a meters map (WildDet3D's training LiDAR format, no densify)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
@@ -271,7 +297,8 @@ def main():
             iobjs = None
             if index is not None:
                 iobjs = {o: v for o, v in index[s].items() if v["category"] in cats}
-            r = precompute_segment(ext, args.outputs, s, args.cache_dir, cats, index_objs=iobjs)
+            r = precompute_segment(ext, args.outputs, s, args.cache_dir, cats,
+                                   index_objs=iobjs, depth_source=args.depth_source)
         except Exception as e:
             r = {"seg": s, "error": repr(e)[:200]}
         dt = time.time() - t0
