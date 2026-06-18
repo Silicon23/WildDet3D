@@ -78,6 +78,8 @@ def main():
     ap.add_argument("--outputs", default="/weka/oe-training-default/weikaih/3d_boundingbox_detection/video_3d_box/itw_3dbox_det/outputs")
     ap.add_argument("--out", required=True)
     ap.add_argument("--fps", type=float, default=10.0)
+    ap.add_argument("--layout", default="sidebyside", choices=["sidebyside", "overlay"],
+                    help="sidebyside = GT+OFF | GT+ON panels (no occlusion); overlay = all on one")
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     dev = a.device
@@ -104,23 +106,43 @@ def main():
     frame_ids = sorted(by_frame.keys())
     im0 = cv2.imread(f"{frames_dir}/{frame_ids[0]:06d}.jpg")
     H, W = im0.shape[:2]
-    vw = cv2.VideoWriter(a.out, cv2.VideoWriter_fourcc(*"mp4v"), a.fps, (W, H))
     GREEN, RED, BLUE = (0,200,0), (0,0,230), (230,80,0)
+    side = (a.layout == "sidebyside")
+    # side-by-side: LEFT = GT+OFF, RIGHT = GT+ON, so neither prediction occludes the
+    # other (the overlay's blue-on-top made ON look better than it is).
+    out_w = W * 2 if side else W
+    vw = cv2.VideoWriter(a.out, cv2.VideoWriter_fourcc(*"mp4v"), a.fps, (out_w, H))
+
+    def b10(x):
+        return corners_cam(x[0:3], x[3:6], quaternion_to_matrix(torch.tensor(x[6:10])).numpy())
+
     for fi in frame_ids:
         img = cv2.imread(f"{frames_dir}/{fi:06d}.jpg")
         if img is None:
             continue
         Ki = (K[fi] if per_frame_K else K)
-        for gt, of, oncol in by_frame[fi]:
-            def b10(x): return corners_cam(x[0:3], x[3:6], quaternion_to_matrix(torch.tensor(x[6:10])).numpy())
-            draw_box(img, project(b10(gt), Ki), GREEN, 2)
-            draw_box(img, project(b10(of), Ki), RED, 2)
-            draw_box(img, project(b10(oncol), Ki), BLUE, 2)
-        cv2.putText(img, "GT=green  OFF=red  ON=blue", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2, cv2.LINE_AA)
-        vw.write(img)
+        if side:
+            L, Rp = img.copy(), img.copy()
+            for gt, of, oncol in by_frame[fi]:
+                draw_box(L, project(b10(gt), Ki), GREEN, 2)
+                draw_box(L, project(b10(of), Ki), RED, 2)
+                draw_box(Rp, project(b10(gt), Ki), GREEN, 2)
+                draw_box(Rp, project(b10(oncol), Ki), BLUE, 2)
+            cv2.putText(L, "temporal OFF (red) vs GT (green)", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2, cv2.LINE_AA)
+            cv2.putText(Rp, "temporal ON (blue) vs GT (green)", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2, cv2.LINE_AA)
+            vw.write(cv2.hconcat([L, Rp]))
+        else:
+            for gt, of, oncol in by_frame[fi]:
+                draw_box(img, project(b10(gt), Ki), GREEN, 2)
+                draw_box(img, project(b10(of), Ki), RED, 2)
+                draw_box(img, project(b10(oncol), Ki), BLUE, 2)
+            cv2.putText(img, "GT=green  OFF=red  ON=blue", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2, cv2.LINE_AA)
+            vw.write(img)
     vw.release()
-    print(f"wrote {a.out}  ({len(frame_ids)} frames, {len(idxs)} tracks)")
+    print(f"wrote {a.out}  ({len(frame_ids)} frames, {len(idxs)} tracks, layout={a.layout})")
 
 
 if __name__ == "__main__":
