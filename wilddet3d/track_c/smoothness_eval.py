@@ -85,34 +85,55 @@ def lag_cosines(d, floor):
     return out
 
 
-def highband_fracs(d, w=32):
+def highband_fracs(d, w=32, return_per_window=False):
     """Energy fraction of d above period cutoffs (<=4, <=8 frames).
-    Hann window, 50% overlap; full-length window if T < w."""
+    Hann window, 50% overlap; full-length window if T < w.
+
+    If ``return_per_window=True``, also returns a list of per-window p4 ratios
+    (one per analysis window across the trajectory). Long tail in the aggregate
+    distribution of these ratios (across all val trajectories) = burst-concentrated
+    jitter, signaling that wavelet (L10) localization would help.
+    """
     T = len(d)
     if T < 6:
+        if return_per_window:
+            return {"hb_frac_p4": np.nan, "hb_frac_p8": np.nan, "per_window_p4": []}
         return {"hb_frac_p4": np.nan, "hb_frac_p8": np.nan}
     W = min(w, T)
     hop = max(W // 2, 1)
     hann = np.hanning(W)
     e_tot = e_p4 = e_p8 = 0.0
+    per_window_p4 = []   # per-window ratio (each: window's HF energy / window's total)
     for s0 in range(0, max(T - W, 0) + 1, hop):
         seg = d[s0:s0 + W]                                  # [W,3]
         seg = seg - seg.mean(0, keepdims=True)
         spec = np.fft.rfft(seg * hann[:, None], axis=0)     # [W//2+1, 3]
         P = (spec.real ** 2 + spec.imag ** 2).sum(-1)       # [K]
         k = np.arange(len(P))
-        e_tot += P[1:].sum()                                # drop DC
-        e_p4 += P[k >= max(W / 4.0, 1)].sum()               # period <= 4 frames
+        win_tot = float(P[1:].sum())
+        win_p4 = float(P[k >= max(W / 4.0, 1)].sum())
+        e_tot += win_tot
+        e_p4 += win_p4
         e_p8 += P[k >= max(W / 8.0, 1)].sum()               # period <= 8 frames
+        if win_tot > 1e-12:
+            per_window_p4.append(win_p4 / win_tot)
     if e_tot <= 1e-12:
+        if return_per_window:
+            return {"hb_frac_p4": np.nan, "hb_frac_p8": np.nan, "per_window_p4": []}
         return {"hb_frac_p4": np.nan, "hb_frac_p8": np.nan}
-    return {"hb_frac_p4": float(e_p4 / e_tot), "hb_frac_p8": float(e_p8 / e_tot)}
+    out = {"hb_frac_p4": float(e_p4 / e_tot), "hb_frac_p8": float(e_p8 / e_tot)}
+    if return_per_window:
+        out["per_window_p4"] = per_window_p4
+    return out
 
 
 def pos_pattern(pred_c, gt_c):
     d = np.diff(pred_c - gt_c, axis=0)                      # [T-1,3] vel deviation
     out = lag_cosines(d, POS_FLOOR)
-    out.update(highband_fracs(d))
+    hb = highband_fracs(d, return_per_window=True)
+    per_window_p4 = hb.pop("per_window_p4")
+    out.update(hb)
+    out["_per_window_p4"] = per_window_p4   # consumed by main() for the L10-go-signal histogram
     n = np.linalg.norm(d, axis=-1)
     for p in (10, 25, 50, 75, 90):
         out[f"dmag_p{p}_mm"] = float(np.percentile(n, p) * 1000) if len(n) else np.nan
@@ -254,10 +275,25 @@ def main():
         res[f"{s}/center_jit_m"] = float(np.nanmean(L[:, 0]))
         res[f"{s}/rot_jit_deg"] = float(np.nanmean(L[:, 1]))
         res[f"{s}/dims_jit_m"] = float(np.nanmean(L[:, 2]))
+    # Collect per-window HF ratios from every trajectory (the L10-go-signal:
+    # long tail in this distribution = burst-concentrated jitter; flat = persistent)
+    per_window_all = {"input": [], "track_c": []}
     for s in ("input", "track_c"):
-        keys = rows[s][0].keys()
+        for r in rows[s]:
+            per_window_all[s].extend(r.pop("_per_window_p4", []))
+        keys = rows[s][0].keys() if rows[s] else []
         for k in keys:
             res[f"{s}/{k}"] = float(np.nanmean([r[k] for r in rows[s]]))
+        pw = np.array(per_window_all[s], dtype=float)
+        if pw.size > 0:
+            for p in (50, 75, 90, 95, 99):
+                res[f"{s}/pw_hb_p4_p{p}"] = float(np.percentile(pw, p))
+            res[f"{s}/pw_hb_p4_max"] = float(pw.max())
+            res[f"{s}/pw_hb_p4_n_windows"] = int(pw.size)
+            # tail metric: p95 / p50. Persistent jitter -> ~1.0-1.5; bursty -> > 2.5
+            p50 = float(np.percentile(pw, 50))
+            res[f"{s}/pw_hb_p4_p95_over_p50"] = (float(np.percentile(pw, 95)) /
+                                                 max(p50, 1e-9))
 
     print(f"\n=== smoothness eval: {args.ckpt} ({res['n_traj']} val trajs) ===")
     print(f"GT center noise floor sigma_gt ~ {res['gt_sigma_mm_median']:.2f} mm/frame")
@@ -271,6 +307,20 @@ def main():
     for k in show:
         print(f"{k:34} {res.get('input/'+k, np.nan):>10.4f} "
               f"{res.get('track_c/'+k, np.nan):>10.4f}")
+    # L10-go-signal: per-window HF-ratio distribution. p95/p50 ratio is the
+    # tail-heaviness indicator — flat (~1) = persistent jitter (L7-L9 work);
+    # heavy tail (>2.5) = burst-concentrated jitter (L10 wavelet would localize).
+    print(f"\nper-window HF(p4) ratio distribution (L10-go-signal):")
+    print(f"  {'source':10} {'n_win':>8} {'p50':>7} {'p75':>7} {'p90':>7} {'p95':>7} {'p99':>7} "
+          f"{'max':>7} {'p95/p50':>8}")
+    for s in ("input", "track_c"):
+        n_win = res.get(f"{s}/pw_hb_p4_n_windows", 0)
+        if n_win > 0:
+            print(f"  {s:10} {n_win:>8d} "
+                  f"{res[f'{s}/pw_hb_p4_p50']:>7.3f} {res[f'{s}/pw_hb_p4_p75']:>7.3f} "
+                  f"{res[f'{s}/pw_hb_p4_p90']:>7.3f} {res[f'{s}/pw_hb_p4_p95']:>7.3f} "
+                  f"{res[f'{s}/pw_hb_p4_p99']:>7.3f} {res[f'{s}/pw_hb_p4_max']:>7.3f} "
+                  f"{res[f'{s}/pw_hb_p4_p95_over_p50']:>8.2f}")
     print(f"\nlegacy energy:  center_jit  rot_jit  dims_jit")
     for s in ("input", "track_c", "gt"):
         print(f"  {s:8} {res[f'{s}/center_jit_m']:>10.4f} "
