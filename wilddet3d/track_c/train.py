@@ -221,6 +221,24 @@ def main():
     ap.add_argument("--rot_delta_deg", type=float, default=0.05,
                     help="sqrt(delta) for rotation flip loss, deg/frame")
     ap.add_argument("--flip_margin", type=float, default=0.2)
+    # Spectral family (doc §5) — operate on velocity deviation d_t = v_pred - v_gt
+    ap.add_argument("--w_l7", type=float, default=0.0,
+                    help="L7 self-normalized HF energy fraction (watch drift gaming)")
+    ap.add_argument("--w_l8", type=float, default=0.0,
+                    help="L8 soft band edge (Hann ramp over one octave above k_c)")
+    ap.add_argument("--w_l9a", type=float, default=0.0,
+                    help="L9a GT-energy denominator (structural anti-gaming variant of L7)")
+    ap.add_argument("--w_l9b", type=float, default=0.0,
+                    help="L9b GT-referenced HF-ratio hinge on predicted velocity")
+    ap.add_argument("--spec_window", type=int, default=16,
+                    help="spectral window length (frames); 50% overlap via spec_hop")
+    ap.add_argument("--spec_hop", type=int, default=8)
+    ap.add_argument("--spec_cutoff_period", type=float, default=4.0,
+                    help="period (frames) at high-band cutoff; k_c = window/period")
+    ap.add_argument("--spec_delta_mm", type=float, default=50.0,
+                    help="velocity-deviation noise-floor stabilizer, mm/frame")
+    ap.add_argument("--spec_l9b_margin", type=float, default=0.05,
+                    help="L9b hinge: penalize when rho(v_pred) > rho(v_gt) + margin")
     ap.add_argument("--init_from", default="",
                     help="warm-start the refiner from a previous run's best.pt "
                          "(arch flags must match); use with few-epoch fine-tunes")
@@ -367,7 +385,8 @@ def main():
             total = loss["loss"]
             dlog, plog = None, None
             w_pattern = (args.w_rotvel2 + args.w_acc_hinge
-                         + args.w_pos_flip + args.w_rot_flip)
+                         + args.w_pos_flip + args.w_rot_flip
+                         + args.w_l7 + args.w_l8 + args.w_l9a + args.w_l9b)
             if (args.w_vel + args.w_acc + args.w_rotvel) > 0 or w_pattern > 0:
                 # decode final-layer boxes per trajectory (single K each) in fp32
                 reg_f = pred[-1]
@@ -395,7 +414,13 @@ def main():
                         flip_lags=flip_lags,
                         pos_delta=(args.pos_delta_mm * 1e-3) ** 2,
                         rot_delta=math.radians(args.rot_delta_deg) ** 2,
-                        flip_margin=args.flip_margin)
+                        flip_margin=args.flip_margin,
+                        w_l7=args.w_l7, w_l8=args.w_l8,
+                        w_l9a=args.w_l9a, w_l9b=args.w_l9b,
+                        spec_window=args.spec_window, spec_hop=args.spec_hop,
+                        spec_cutoff_period=args.spec_cutoff_period,
+                        spec_delta_mm=args.spec_delta_mm,
+                        spec_l9b_margin=args.spec_l9b_margin)
                     total = total + plog["loss"]
             total.backward()
             torch.nn.utils.clip_grad_norm_(

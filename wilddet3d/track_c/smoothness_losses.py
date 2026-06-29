@@ -236,6 +236,134 @@ def rotation_flip_loss(
 
 
 # --------------------------------------------------------------------------
+# Spectral (frequency-domain) losses — L7, L8, L9a, L9b (doc §5)
+# --------------------------------------------------------------------------
+
+def _windowed_rfft_power(x: Tensor, window: int, hop: int, taper: Tensor) -> Tensor:
+    """Hann-tapered windowed rFFT power. x: [T, C] -> P: [n_w, n_freq, C].
+    Per-window mean-subtract, multiply by Hann, rFFT along time, |D|^2.
+    n_freq = window // 2 + 1. Returns shape [0, n_freq, C] if T < window."""
+    T, C = x.shape
+    n_freq = window // 2 + 1
+    if T < window:
+        return x.new_zeros((0, n_freq, C))
+    n_w = (T - window) // hop + 1
+    starts = torch.arange(n_w, device=x.device) * hop
+    idx = starts[:, None] + torch.arange(window, device=x.device)[None, :]  # [n_w, W]
+    w = x[idx]                                            # [n_w, W, C]
+    w = w - w.mean(dim=1, keepdim=True)
+    w = w * taper[None, :, None]
+    D = torch.fft.rfft(w, n=window, dim=1)                # [n_w, n_freq, C]
+    return D.real ** 2 + D.imag ** 2
+
+
+def spectral_smoothness_loss(
+    pred_center: Tensor, gt_center: Tensor,
+    sizes: Sequence[int], valid: Tensor,
+    window: int = 16, hop: int = 8,
+    cutoff_period_frames: float = 4.0,
+    delta_mm: float = 50.0,
+    w_l7: float = 0.0, w_l8: float = 0.0,
+    w_l9a: float = 0.0, w_l9b: float = 0.0,
+    l9b_margin: float = 0.05,
+) -> dict:
+    """Frequency-domain smoothness losses on velocity deviation d_t = v_pred - v_gt.
+
+    Implements doc §5:
+      L7  = E_high(d) / (E_total(d) + delta)               self-normalized HF fraction
+      L8  = sum_k w_k P_k(d) / (E_total(d) + delta)        soft band edge (Hann ramp)
+      L9a = E_high(d) / (E_total(v_gt) + delta)            GT-energy denominator (anti-gaming)
+      L9b = ReLU(rho(v_pred) - rho(v_gt) - margin)         GT-referenced HF-ratio hinge
+
+    Hann window (length ``window``) with 50% overlap (``hop=window/2``); per-window
+    mean is subtracted before tapering. ``cutoff_period_frames`` sets the high-
+    band start: k_c = window / cutoff_period_frames (e.g. window=16, cutoff=4 ->
+    k_c=4 -> high band = periods < 4 frames). ``delta_mm`` is the eps stabilizer
+    in mm/frame velocity units (squared internally to m^2).
+
+    Skip trajectories with <window+1 frames or any invalid frames in their span.
+    Returns zero loss if no trajectory contributes any window (no NaN).
+
+    Monitors (doc §5 + §7): ``mon_e_low``, ``mon_e_high`` (raw deviation band
+    energies — diverging while L_spec decreases = spectral gaming),
+    ``mon_rho_pred``, ``mon_rho_gt`` (for L9b hinge interpretation).
+    """
+    if max(w_l7, w_l8, w_l9a, w_l9b) <= 0:
+        z = pred_center.new_zeros(())
+        return {"loss": z, "mon_e_low": z, "mon_e_high": z,
+                "mon_rho_pred": z, "mon_rho_gt": z}
+
+    dev, dtype = pred_center.device, pred_center.dtype
+    taper = torch.hann_window(window, periodic=False, device=dev, dtype=dtype)
+    n_freq = window // 2 + 1
+    k_c = max(1, int(window / cutoff_period_frames))
+    # L8 Hann-ramped band weights: 0->1 over one octave [k_c, 2*k_c], then 1.
+    band_w = torch.zeros(n_freq, device=dev, dtype=dtype)
+    ramp_end = min(2 * k_c, n_freq - 1)
+    if ramp_end > k_c:
+        for k in range(k_c + 1, ramp_end + 1):
+            band_w[k] = (k - k_c) / (ramp_end - k_c)
+    band_w[ramp_end + 1:] = 1.0
+    delta = (delta_mm * 1e-3) ** 2
+
+    terms_l7, terms_l8, terms_l9a, terms_l9b = [], [], [], []
+    mon_e_low, mon_e_high, mon_rho_p, mon_rho_g = [], [], [], []
+    for a, b in _iter_trajs(sizes):
+        if b - a < window + 1:
+            continue
+        if valid is not None and not bool(valid[a:b].all()):
+            continue
+        v_pred = pred_center[a + 1:b] - pred_center[a:b - 1]
+        v_gt = gt_center[a + 1:b] - gt_center[a:b - 1]
+        d = v_pred - v_gt
+        if d.shape[0] < window:
+            continue
+        P_d = _windowed_rfft_power(d, window, hop, taper)
+        P_p = _windowed_rfft_power(v_pred, window, hop, taper)
+        P_g = _windowed_rfft_power(v_gt, window, hop, taper)
+        if P_d.shape[0] == 0:
+            continue
+        # exclude DC (k=0) from totals; high band = k > k_c
+        E_total_d = P_d[:, 1:, :].sum(dim=1)            # [n_w, C]
+        E_high_d  = P_d[:, k_c + 1:, :].sum(dim=1)
+        E_low_d   = E_total_d - E_high_d
+        E_high_w  = (P_d * band_w[None, :, None]).sum(dim=1)
+        E_total_g = P_g[:, 1:, :].sum(dim=1)
+        E_total_p = P_p[:, 1:, :].sum(dim=1)
+        E_high_p  = P_p[:, k_c + 1:, :].sum(dim=1)
+        E_high_g  = P_g[:, k_c + 1:, :].sum(dim=1)
+        l7 = (E_high_d / (E_total_d + delta)).mean()
+        l8 = (E_high_w / (E_total_d + delta)).mean()
+        l9a = (E_high_d / (E_total_g + delta)).mean()
+        rho_p = E_high_p / (E_total_p + delta)
+        rho_g = E_high_g / (E_total_g + delta)
+        l9b = torch.clamp(rho_p - rho_g - l9b_margin, min=0).mean()
+        terms_l7.append(l7); terms_l8.append(l8)
+        terms_l9a.append(l9a); terms_l9b.append(l9b)
+        mon_e_low.append(E_low_d.mean().detach())
+        mon_e_high.append(E_high_d.mean().detach())
+        mon_rho_p.append(rho_p.mean().detach())
+        mon_rho_g.append(rho_g.mean().detach())
+
+    z = pred_center.new_zeros(())
+    if not terms_l7:
+        return {"loss": z, "mon_e_low": z, "mon_e_high": z,
+                "mon_rho_pred": z, "mon_rho_gt": z}
+    L7 = torch.stack(terms_l7).mean()
+    L8v = torch.stack(terms_l8).mean()
+    L9A = torch.stack(terms_l9a).mean()
+    L9B = torch.stack(terms_l9b).mean()
+    loss = w_l7 * L7 + w_l8 * L8v + w_l9a * L9A + w_l9b * L9B
+    return {"loss": loss,
+            "loss_l7": L7.detach(), "loss_l8": L8v.detach(),
+            "loss_l9a": L9A.detach(), "loss_l9b": L9B.detach(),
+            "mon_e_low": torch.stack(mon_e_low).mean(),
+            "mon_e_high": torch.stack(mon_e_high).mean(),
+            "mon_rho_pred": torch.stack(mon_rho_p).mean(),
+            "mon_rho_gt": torch.stack(mon_rho_g).mean()}
+
+
+# --------------------------------------------------------------------------
 # Bundle — one call from the trainer
 # --------------------------------------------------------------------------
 
@@ -253,6 +381,16 @@ def pattern_smoothness_loss(
     pos_delta: float = 25e-6,
     rot_delta: float = 7.6e-7,
     flip_margin: float = 0.2,
+    # Spectral family (doc §5) on velocity deviation d_t = v_pred - v_gt
+    w_l7: float = 0.0,           # self-normalized HF energy fraction
+    w_l8: float = 0.0,           # soft band edge (Hann ramp)
+    w_l9a: float = 0.0,          # GT-energy denominator (anti-gaming)
+    w_l9b: float = 0.0,          # GT-referenced HF-ratio hinge
+    spec_window: int = 16,
+    spec_hop: int = 8,
+    spec_cutoff_period: float = 4.0,
+    spec_delta_mm: float = 50.0,
+    spec_l9b_margin: float = 0.05,
 ) -> dict:
     """Compose the first-wave pattern terms. Returns total + per-term values +
     monitors (all monitors prefixed mon_)."""
@@ -281,5 +419,22 @@ def pattern_smoothness_loss(
         total = total + w_rot_flip * r5["loss"]
         out["loss_rot_flip"] = r5["loss"].detach()
         out.update({f"rot_{k}": v for k, v in r5.items() if k.startswith("mon_")})
+    if max(w_l7, w_l8, w_l9a, w_l9b) > 0:
+        sp = spectral_smoothness_loss(
+            pred_center, gt_center, sizes, valid,
+            window=spec_window, hop=spec_hop,
+            cutoff_period_frames=spec_cutoff_period,
+            delta_mm=spec_delta_mm,
+            w_l7=w_l7, w_l8=w_l8, w_l9a=w_l9a, w_l9b=w_l9b,
+            l9b_margin=spec_l9b_margin,
+        )
+        total = total + sp["loss"]
+        if "loss_l7" in sp:
+            out["loss_l7"] = sp["loss_l7"]; out["loss_l8"] = sp["loss_l8"]
+            out["loss_l9a"] = sp["loss_l9a"]; out["loss_l9b"] = sp["loss_l9b"]
+        out["mon_spec_e_low"] = sp["mon_e_low"]
+        out["mon_spec_e_high"] = sp["mon_e_high"]
+        out["mon_spec_rho_pred"] = sp["mon_rho_pred"]
+        out["mon_spec_rho_gt"] = sp["mon_rho_gt"]
     out["loss"] = total
     return out
