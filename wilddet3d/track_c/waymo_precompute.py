@@ -81,6 +81,47 @@ def _mask_bbox_xyxy(rle_dict, h, w):
     return [float(max(0, x0)), float(max(0, y0)), float(min(w - 1, x1)), float(min(h - 1, y1))]
 
 
+def _gt_box2d_from_obj(gt_obj, K, H, W):
+    """Project the 8 GT 3D corners through K -> tight xyxy 2D box (+2px pad).
+
+    Uses gt_obj['corners_cam'] if present; otherwise reconstructs from
+    (center_cam, dims_lhw, R_cam). Corners with z <= 0.1m are dropped (behind
+    camera). Returns None if < 4 corners project in front.
+
+    IMPORTANT: K here must be the SAME intrinsics the model will see (GT-K
+    when intrinsics_source='gt'), so the geo prompt lands in the same pixel
+    frame as the image the frozen encoder consumes.
+    """
+    corners = None
+    if "corners_cam" in gt_obj:
+        arr = np.asarray(gt_obj["corners_cam"], dtype=np.float32)
+        if arr.ndim == 2 and arr.shape[0] == 8 and arr.shape[1] == 3:
+            corners = arr
+    if corners is None:
+        c = np.asarray(gt_obj["center_cam"], np.float32)
+        d = np.asarray(gt_obj.get("dims_lhw") or gt_obj["dims_xyz_obj"], np.float32)
+        R = np.asarray(gt_obj["R_cam"], np.float32)
+        hx, hy, hz = d / 2
+        local = np.array([[-hx,-hy,-hz],[+hx,-hy,-hz],[+hx,+hy,-hz],[-hx,+hy,-hz],
+                          [-hx,-hy,+hz],[+hx,-hy,+hz],[+hx,+hy,+hz],[-hx,+hy,+hz]],
+                         dtype=np.float32)
+        corners = (R @ local.T).T + c
+    xs, ys = [], []
+    for x, y, z in corners:
+        if z > 0.1:
+            xs.append(float(K[0, 0] * x / z + K[0, 2]))
+            ys.append(float(K[1, 1] * y / z + K[1, 2]))
+    if len(xs) < 4:
+        return None
+    x0 = max(0.0, min(xs) - 2)
+    y0 = max(0.0, min(ys) - 2)
+    x1 = min(float(W - 1), max(xs) + 2)
+    y1 = min(float(H - 1), max(ys) + 2)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+    return [x0, y0, x1, y1]
+
+
 def _load_gt(outputs_dir, seg):
     """boxes.json -> ({frame_index: {obj_id: obj}}, {obj_id: category},
     {frame_index: ts_micros})."""
@@ -128,7 +169,8 @@ def _load_pairing_index(outputs_dir, path):
 
 
 def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs=None,
-                       depth_source="vipe"):
+                       depth_source="vipe", intrinsics_source="vipe",
+                       geo_prompt_source="mask"):
     done_marker = f"{cache_dir}/.done/{seg}"
     if os.path.exists(done_marker):
         return {"seg": seg, "skipped": True}
@@ -139,7 +181,12 @@ def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs=
     if not os.path.isdir(frames_dir):
         return {"seg": seg, "error": "no step1 frames"}
     gt_by_frame, gt_cat, gt_ts = _load_gt(outputs_dir, seg)
-    K_all = np.load(f"{step1}/intrinsics.npy")
+    # ViPE (step1) intrinsics are per-video unreliable on Waymo (focal off up to ~5x);
+    # GT intrinsics (waymo_production/<seg>/gt) are the true Waymo calibration.
+    if intrinsics_source == "gt":
+        K_all = np.load(f"{outputs_dir}/waymo_production/{seg}/gt/intrinsics.npy")
+    else:
+        K_all = np.load(f"{step1}/intrinsics.npy")
     per_frame_K = K_all.ndim == 3
 
     # which tracked objects to process: canonical pairing-index list if provided
@@ -157,10 +204,17 @@ def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs=
             nb = {}
         if not nb:
             continue
-        mpath = f"{outputs_dir}/step2_waymo/{seg}/{obj}/masks_rle.json"
-        if not os.path.exists(mpath):
-            continue
-        objs[obj] = {"noisy": nb, "masks": json.load(open(mpath)),
+        # In gt-2D mode we don't need SAM3 masks — identity comes from projecting
+        # the GT 3D box for the correct object. In mask mode we do (and skip the
+        # track if the mask file is absent, since that means Step-2 dropped it).
+        if geo_prompt_source == "mask":
+            mpath = f"{outputs_dir}/step2_waymo/{seg}/{obj}/masks_rle.json"
+            if not os.path.exists(mpath):
+                continue
+            masks = json.load(open(mpath))
+        else:
+            masks = None
+        objs[obj] = {"noisy": nb, "masks": masks,
                      "frames": index_objs[obj]["frames"] if index_objs else None}
     if not objs:
         os.makedirs(f"{cache_dir}/.done", exist_ok=True)
@@ -179,17 +233,24 @@ def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs=
                 continue  # restrict to canonical paired frames
             if obj not in gt_by_frame[idx]:
                 continue
-            mk = d["masks"].get(str(idx))
-            if mk is None or mk.get("mask_rle") is None:
-                continue
-            present.append((obj, mk["mask_rle"]))
+            if geo_prompt_source == "mask":
+                mk = d["masks"].get(str(idx))
+                if mk is None or mk.get("mask_rle") is None:
+                    continue
+                present.append((obj, mk["mask_rle"]))
+            else:  # gt-2D box from GT 3D corners projected through K
+                present.append((obj, None))
         if not present:
             continue
         img = np.array(Image.open(f"{frames_dir}/{idx:06d}.jpg").convert("RGB")).astype(np.float32)
         H, W = img.shape[:2]
+        K = (K_all[idx] if per_frame_K else K_all).astype(np.float32)
         prompts, kept = [], []
-        for obj, rle in present:
-            bb = _mask_bbox_xyxy(rle, H, W)
+        for obj, mk in present:
+            if geo_prompt_source == "mask":
+                bb = _mask_bbox_xyxy(mk, H, W)
+            else:
+                bb = _gt_box2d_from_obj(gt_by_frame[idx][obj], K, H, W)
             if bb is not None:
                 prompts.append(bb); kept.append(obj)
         if not prompts:
@@ -199,7 +260,6 @@ def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs=
         else:
             dpath = f"{depth_dir}/{idx:06d}.npy"
             depth = np.load(dpath).astype(np.float32) if os.path.exists(dpath) else None
-        K = (K_all[idx] if per_frame_K else K_all).astype(np.float32)
         feat = ext.extract(img, K, prompts, depth=depth)
 
         frame_cache[idx] = {
@@ -272,6 +332,14 @@ def main():
     ap.add_argument("--depth_source", default="vipe", choices=["vipe", "lidar"],
                     help="vipe = step1_waymo ViPE depth (default); lidar = sparse GT-LiDAR "
                          "splatted to a meters map (WildDet3D's training LiDAR format, no densify)")
+    ap.add_argument("--intrinsics_source", default="vipe", choices=["vipe", "gt"],
+                    help="vipe = step1_waymo ViPE intrinsics (default, per-video unreliable: "
+                         "focal off up to ~5x); gt = waymo_production/<seg>/gt true calibration")
+    ap.add_argument("--geo_prompt_source", default="mask", choices=["mask", "gt"],
+                    help="mask = SAM3 Step-2 mask -> tight xyxy (shipped pipeline, but SAM3 "
+                         "identity drifts on far/small objects); gt = project 8 GT 3D corners "
+                         "through GT-K -> tight xyxy (use when eval-only or benchmarking; "
+                         "requires intrinsics_source='gt' for geometric consistency)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
@@ -298,7 +366,9 @@ def main():
             if index is not None:
                 iobjs = {o: v for o, v in index[s].items() if v["category"] in cats}
             r = precompute_segment(ext, args.outputs, s, args.cache_dir, cats,
-                                   index_objs=iobjs, depth_source=args.depth_source)
+                                   index_objs=iobjs, depth_source=args.depth_source,
+                                   intrinsics_source=args.intrinsics_source,
+                                   geo_prompt_source=args.geo_prompt_source)
         except Exception as e:
             r = {"seg": s, "error": repr(e)[:200]}
         dt = time.time() - t0
