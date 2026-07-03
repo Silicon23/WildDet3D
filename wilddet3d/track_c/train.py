@@ -193,6 +193,15 @@ def main():
                     help="Flavor 2: per-frame query attends the whole within-object "
                          "timeline of temporal tokens (timestamp PE on q+k, block-diagonal "
                          "mask) instead of a single token. Breaks the single-key degeneracy.")
+    ap.add_argument("--temporal_block", default="prompt3d",
+                    choices=["prompt3d", "xattn_only"],
+                    help="xattn_only = pure cross-attn temporal block (no self-attn/FFN "
+                         "query-only shortcut; the 2026-07-03 fix). prompt3d = original.")
+    ap.add_argument("--mask_frame_p", type=float, default=0.0,
+                    help="masked-frame objective: fraction of frames per batch whose "
+                         "visual evidence (hidden state + depth latents) is withheld "
+                         "during training; their box is still supervised, forcing the "
+                         "temporal cross-attn to read neighbors' tokens. 0 = off.")
     ap.add_argument("--w_center", type=float, default=1.0)
     ap.add_argument("--w_depth", type=float, default=1.0)
     ap.add_argument("--w_dims", type=float, default=1.0)
@@ -289,6 +298,7 @@ def main():
         use_layer_bias=bool(args.use_layer_bias),
         use_temporal_kv_norm=bool(args.temporal_kv_norm),
         temporal_multi_token=bool(args.temporal_multi_token),
+        temporal_block=args.temporal_block,
     ).to(dev)
     info = refiner.load_pretrained_head(args.ckpt)
     print(f"[build] head load: {info['loaded']} tensors, new={len(info['missing'])}", flush=True)
@@ -303,8 +313,19 @@ def main():
         print("[build] no_temporal: temporal-prompt gates frozen at 0 (ablation)", flush=True)
     if args.init_from:
         sd = torch.load(args.init_from, map_location="cpu", weights_only=False)["refiner"]
-        refiner.load_state_dict(sd, strict=True)
-        print(f"[build] warm-started full refiner from {args.init_from}", flush=True)
+        # strict=False so we can warm-start a temporal-ON refiner from a temporal-OFF
+        # checkpoint (or vice-versa): the source ckpt lacks the temporal modules
+        # (traj_encoder, project_temporal, prompt_temporal, temporal_gate,
+        # temporal_kv_norm) that the destination has, or has them but they're
+        # absent from the destination. Report the delta so silent mismatches are
+        # visible in the log.
+        missing, unexpected = refiner.load_state_dict(sd, strict=False)
+        print(f"[build] warm-started full refiner from {args.init_from} "
+              f"(loaded, missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
+        if missing:
+            print(f"[build]   missing keys sample: {missing[:3]}{'...' if len(missing) > 3 else ''}", flush=True)
+        if unexpected:
+            print(f"[build]   unexpected keys sample: {unexpected[:3]}{'...' if len(unexpected) > 3 else ''}", flush=True)
 
     # Higher LR for the new temporal modules (esp. the zero-init LayerScale gate)
     flip_lags = tuple(int(x) for x in str(args.flip_lags).split(",") if x.strip())
@@ -373,8 +394,14 @@ def main():
         for grp in groups:
             packs = [train_ds[i] for i in grp]
             batch = to_dev(collate_trajs(packs), dev)
+            # Masked-frame objective: withhold visual evidence for a random
+            # subset of frames (train-time only); their boxes stay supervised.
+            frame_mask = None
+            if args.mask_frame_p > 0:
+                sum_T = batch["hidden"].shape[1]
+                frame_mask = (torch.rand(sum_T, device=dev) < args.mask_frame_p)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                out = refiner.forward_vectorized(batch)
+                out = refiner.forward_vectorized(batch, frame_mask=frame_mask)
             pred = out["reg"][:, :, 0, :].float()
             valid = batch["gt_center"][:, 2] > 1e-3
             gt_R = quaternion_to_matrix(batch["gt_quat"])

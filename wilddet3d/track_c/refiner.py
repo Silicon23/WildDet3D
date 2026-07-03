@@ -44,6 +44,7 @@ class TrackCRefiner(nn.Module):
         use_layer_bias: bool = False,
         use_temporal_kv_norm: bool = False,
         temporal_multi_token: bool = False,
+        temporal_block: str = "prompt3d",
     ) -> None:
         super().__init__()
         self.coder = box_coder or Det3DCoder()
@@ -64,6 +65,7 @@ class TrackCRefiner(nn.Module):
             use_layer_bias=use_layer_bias,
             use_temporal_kv_norm=use_temporal_kv_norm,
             temporal_multi_token=temporal_multi_token,
+            temporal_block=temporal_block,
         )
         if use_temporal_modules:
             self.traj_encoder = TrajectoryEncoder(
@@ -71,6 +73,11 @@ class TrackCRefiner(nn.Module):
             )
         else:
             self.traj_encoder = None
+        # Masked-frame objective (2026-07-03 shortcut fix, part 2): a learned
+        # [MASK] embedding substituted for the visual hidden state of masked
+        # frames during training. Created unconditionally (256 params) so
+        # checkpoints stay compatible whether or not masking is used.
+        self.mask_embed = nn.Parameter(torch.zeros(1, traj_token_dim))
 
     # ---- pretrained-head loading -------------------------------------------
     def load_pretrained_head(self, checkpoint_path: str, map_location="cpu") -> dict:
@@ -225,7 +232,7 @@ class TrackCRefiner(nn.Module):
         return {"reg": stacked_reg, "conf": stacked_conf,
                 "sizes": sizes, "box_out": box_outs}
 
-    def forward_vectorized(self, batch: dict) -> dict:
+    def forward_vectorized(self, batch: dict, frame_mask: Tensor | None = None) -> dict:
         """Fully-vectorized batched forward (no per-trajectory Python loop).
 
         ``batch`` (from ``collate_trajs``):
@@ -234,8 +241,25 @@ class TrackCRefiner(nn.Module):
           box2d [sum_T, 4], K [sum_T, 3, 3] (per-frame), input_hw
         Valid (non-pad) frames in row-major (k, t) order match the concatenated
         head inputs, so ``tokens[~pad_mask]`` aligns with them.
+
+        ``frame_mask`` [sum_T] bool (optional): the masked-frame objective.
+        True = this frame's PER-FRAME visual evidence is withheld — its hidden
+        state (all layers) is replaced by the learned ``mask_embed`` and its
+        depth latents are zeroed. Ray embeddings (generic camera geometry) and
+        the 2D box anchor (decode reference) are kept. The frame's box is still
+        supervised, so the only path to predicting its depth/dims/rotation is
+        reading the OTHER frames' tokens through the temporal cross-attn.
+        The trajectory-encoder input (box_repr) is NOT masked — the encoder's
+        tokens are exactly what the masked frame must read.
         """
         valid = ~batch["pad_mask"]                       # [K,Tmax]
+        if frame_mask is not None and bool(frame_mask.any()):
+            # hidden: [L, sum_T, 1, 256] — substitute mask_embed on masked frames
+            hidden = batch["hidden"].clone()
+            hidden[:, frame_mask] = self.mask_embed.to(hidden.dtype)  # bcast [1,256]->[L,n,1,256]
+            depth = batch["depth"].clone()
+            depth[frame_mask] = 0                        # [sum_T, ntok, 256]
+            batch = {**batch, "hidden": hidden, "depth": depth}
         temporal_pe = None
         temporal_attn_mask = None
         if self.use_temporal_modules:

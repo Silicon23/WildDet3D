@@ -78,6 +78,7 @@ class Det3DHead(nn.Module):
         use_layer_bias: bool = False,
         use_temporal_kv_norm: bool = False,
         temporal_multi_token: bool = False,
+        temporal_block: str = "prompt3d",
     ) -> None:
         """Initialize the 3D detection head.
 
@@ -146,10 +147,23 @@ class Det3DHead(nn.Module):
 
         # Temporal prompt branch (Track C). Cloned per prediction layer, gated
         # by a per-layer zero-init LayerScale so it is identity at init.
+        # temporal_block selects the block architecture:
+        #   "prompt3d"   — original Prompt3DQueryLayer (self-attn + cross-attn
+        #                  + FFN). Has the query-only gradient shortcut.
+        #   "xattn_only" — TemporalCrossAttnLayer: pure cross-attn readout, no
+        #                  query-only path (the 2026-07-03 shortcut fix).
+        assert temporal_block in ("prompt3d", "xattn_only"), temporal_block
+        self.temporal_block = temporal_block
         if self.use_temporal_prompt:
-            project_temporal, prompt_temporal = self._get_condition_branch(
-                input_dims=traj_token_dim, expansion=4, embed_dims=embed_dims
-            )
+            if temporal_block == "xattn_only":
+                project_temporal, _ = self._get_condition_branch(
+                    input_dims=traj_token_dim, expansion=4, embed_dims=embed_dims
+                )
+                prompt_temporal = TemporalCrossAttnLayer(embed_dims)
+            else:
+                project_temporal, prompt_temporal = self._get_condition_branch(
+                    input_dims=traj_token_dim, expansion=4, embed_dims=embed_dims
+                )
             self.project_temporal = get_clones(
                 project_temporal, self.num_pred_layer
             )
@@ -263,6 +277,16 @@ class Det3DHead(nn.Module):
         assert self.use_temporal_prompt and self.use_depth_prompt, (
             "warm-start needs both temporal and depth prompt branches"
         )
+        if self.temporal_block == "xattn_only":
+            # TemporalCrossAttnLayer is structurally different from the depth
+            # branch's Prompt3DQueryLayer — only the projection MLP transfers.
+            for i in range(self.num_pred_layer):
+                self.project_temporal[i].load_state_dict(
+                    self.project_depth[i].state_dict()
+                )
+            print("[head] warm-start (xattn_only): project_temporal only — "
+                  "the cross-attn block trains from scratch", flush=True)
+            return
         for i in range(self.num_pred_layer):
             self.project_temporal[i].load_state_dict(
                 self.project_depth[i].state_dict()
@@ -437,6 +461,63 @@ class Det3DHead(nn.Module):
             all_layers_conf_3d.append(conf_output)
 
         return torch.stack(all_layers_outputs_3d), torch.stack(all_layers_conf_3d)
+
+
+class TemporalCrossAttnLayer(nn.Module):
+    """Cross-attention-ONLY temporal block (Track C gradient-shortcut fix).
+
+    ``Prompt3DQueryLayer`` (used by the ray/depth prompts and the original
+    temporal branch) contains self-attn + FFN in addition to the cross-attn.
+    For the temporal branch that provides a gradient shortcut: the block can
+    reduce the loss purely by transforming the QUERY (per-frame feature) while
+    its cross-attn contribution collapses to a token-independent constant.
+    Empirically confirmed 2026-07-03: token interventions (zero/shuffle/random)
+    move IoU by <= 0.0003 while gates_zero collapses the model — the branch is
+    load-bearing via query-processing, not trajectory-reading. Feeding perfect
+    GT trajectories does not change this (the shortcut is architectural).
+
+    This block removes the shortcut. Its output is ``query + delta`` where
+    ``delta = LN(MHA(query+q_pos, tokens+k_pos, tokens))`` — the delta is
+    EXACTLY the attention readout of the tokens. The external LayerScale gate
+    then applies ``hidden + gate * (updated - hidden) = hidden + gate * delta``
+    unchanged. If the tokens carry nothing, the best the branch can do is
+    inject a constant (value collapse) — which the masked-frame objective
+    (train.py --mask_frame_p) removes as an escape: on masked frames the box
+    is only predictable by *reading token content*.
+    """
+
+    def __init__(self, embed_dims: int = 256, num_heads: int = 4) -> None:
+        """Init. num_heads=4 (vs 1 in Prompt3DQueryLayer's cross-attn) gives
+        the readout more selectivity over the timeline."""
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dims, num_heads, batch_first=True
+        )
+        self.norm_out = nn.LayerNorm(embed_dims)
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        query_pos: Tensor | None = None,
+        key_pos: Tensor | None = None,
+        attn_mask: Tensor | None = None,
+        key_padding_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Forward. Same signature as Prompt3DQueryLayer for drop-in use.
+
+        Returns ``query + LN(attention_readout)`` so the caller's
+        ``hidden + gate * (updated - hidden)`` yields a purely token-driven
+        update. No self-attn, no FFN — no query-only computation path.
+        """
+        q = query if query_pos is None else query + query_pos
+        k = key if key_pos is None else key + key_pos
+        out, _ = self.attn(
+            q, k, value, attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask, need_weights=False,
+        )
+        return query + self.norm_out(out)
 
 
 class Prompt3DQueryLayer(nn.Module):
