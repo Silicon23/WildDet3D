@@ -84,9 +84,11 @@ def _load_gt(outputs_dir, seg):
     return by_frame, cat, ts
 
 
-def _noisy_boxes(outputs_dir, seg, obj):
-    """ADT step4 meta -> {step1_index: box_repr[12]} for frames with FP box."""
-    m = json.load(open(f"{outputs_dir}/step4_adt_production/{seg}/{obj}/meta.json"))
+def _noisy_boxes(outputs_dir, seg, obj, step4_subdir="step4_adt_production"):
+    """ADT step4 meta -> {step1_index: box_repr[12]} for frames with FP box.
+    step4_subdir: 'step4_adt_production' (ViPE pipeline, default) OR
+    'step4_adt_production_gt' (regen GT-K+GT-dense pipeline, task #41)."""
+    m = json.load(open(f"{outputs_dir}/{step4_subdir}/{seg}/{obj}/meta.json"))
     out = {}
     for f in m["frames"]:
         b = f.get("box")
@@ -118,7 +120,7 @@ def _load_pairing_index(outputs_dir, path):
 
 
 def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs,
-                       geo_prompt_source="gt"):
+                       geo_prompt_source="gt", step4_subdir="step4_adt_production"):
     done_marker = f"{cache_dir}/.done/{seg}"
     if os.path.exists(done_marker):
         return {"seg": seg, "skipped": True}
@@ -135,7 +137,7 @@ def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs,
     objs = {}
     for obj in obj_names:
         try:
-            nb = _noisy_boxes(outputs_dir, seg, obj)
+            nb = _noisy_boxes(outputs_dir, seg, obj, step4_subdir=step4_subdir)
         except Exception:
             nb = {}
         if not nb:
@@ -264,6 +266,10 @@ def main():
                     help="gt = project 8 GT 3D corners through GT-K -> tight xyxy (default, "
                          "since ADT has canonical GT for everything); mask = SAM3 Step-2 mask "
                          "(only for shipped-pipeline simulation)")
+    ap.add_argument("--step4_subdir", default="step4_adt_production",
+                    help="trajectory-prior source: step4_adt_production (ViPE pipeline, "
+                         "default) OR step4_adt_production_gt (regen GT-K+GT-dense pipeline, "
+                         "task #41; 17mm median center err on smoke pair 778 vs 231mm ViPE)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
@@ -289,7 +295,8 @@ def main():
             iobjs = {o: v for o, v in index[s].items()
                      if (cats is None or v["category"] in cats)}
             r = precompute_segment(ext, args.outputs, s, args.cache_dir, cats or set(),
-                                   iobjs, geo_prompt_source=args.geo_prompt_source)
+                                   iobjs, geo_prompt_source=args.geo_prompt_source,
+                                   step4_subdir=args.step4_subdir)
         except Exception as e:
             r = {"seg": s, "error": repr(e)[:200]}
         dt = time.time() - t0

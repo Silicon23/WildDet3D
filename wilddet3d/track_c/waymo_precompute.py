@@ -138,9 +138,11 @@ def _load_gt(outputs_dir, seg):
     return by_frame, cat, ts
 
 
-def _noisy_boxes(outputs_dir, seg, obj):
-    """step4 meta -> {step1_index: box_repr[12]} for frames with a valid FP box."""
-    m = json.load(open(f"{outputs_dir}/step4_waymo/{seg}/{obj}/meta.json"))
+def _noisy_boxes(outputs_dir, seg, obj, step4_subdir="step4_waymo"):
+    """step4 meta -> {step1_index: box_repr[12]} for frames with a valid FP box.
+    step4_subdir picks the trajectory-prior source: 'step4_waymo' (ViPE-K pipeline,
+    default) or 'step4_waymo_gt' (regenerated GT-K+GT-LiDAR pipeline, task #41)."""
+    m = json.load(open(f"{outputs_dir}/{step4_subdir}/{seg}/{obj}/meta.json"))
     out = {}
     for f in m["frames"]:
         b = f.get("box")
@@ -170,7 +172,7 @@ def _load_pairing_index(outputs_dir, path):
 
 def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs=None,
                        depth_source="vipe", intrinsics_source="vipe",
-                       geo_prompt_source="mask"):
+                       geo_prompt_source="mask", step4_subdir="step4_waymo"):
     done_marker = f"{cache_dir}/.done/{seg}"
     if os.path.exists(done_marker):
         return {"seg": seg, "skipped": True}
@@ -194,12 +196,12 @@ def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs=
     if index_objs is not None:
         obj_names = sorted(index_objs.keys())
     else:
-        obj_names = [o for o in sorted(os.listdir(f"{outputs_dir}/step4_waymo/{seg}"))
+        obj_names = [o for o in sorted(os.listdir(f"{outputs_dir}/{step4_subdir}/{seg}"))
                      if gt_cat.get(o) in categories]
     objs = {}
     for obj in obj_names:
         try:
-            nb = _noisy_boxes(outputs_dir, seg, obj)
+            nb = _noisy_boxes(outputs_dir, seg, obj, step4_subdir=step4_subdir)
         except Exception:
             nb = {}
         if not nb:
@@ -340,6 +342,10 @@ def main():
                          "identity drifts on far/small objects); gt = project 8 GT 3D corners "
                          "through GT-K -> tight xyxy (use when eval-only or benchmarking; "
                          "requires intrinsics_source='gt' for geometric consistency)")
+    ap.add_argument("--step4_subdir", default="step4_waymo",
+                    help="trajectory-prior source under outputs/: step4_waymo (ViPE-K pipeline, "
+                         "default; median center err 5-13m on val) OR step4_waymo_gt (regenerated "
+                         "GT-K + GT-LiDAR pipeline, task #41; median <1m on smoke pair 722)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
@@ -351,7 +357,7 @@ def main():
         segs_all = sorted(s for s, objs in index.items()
                           if any(o["category"] in cats for o in objs.values()))
     else:
-        segs_all = sorted(os.listdir(f"{args.outputs}/step4_waymo"))
+        segs_all = sorted(os.listdir(f"{args.outputs}/{args.step4_subdir}"))
     segs = [s for i, s in enumerate(segs_all) if i % args.num_shards == args.shard]
     if args.limit:
         segs = segs[:args.limit]
@@ -368,7 +374,8 @@ def main():
             r = precompute_segment(ext, args.outputs, s, args.cache_dir, cats,
                                    index_objs=iobjs, depth_source=args.depth_source,
                                    intrinsics_source=args.intrinsics_source,
-                                   geo_prompt_source=args.geo_prompt_source)
+                                   geo_prompt_source=args.geo_prompt_source,
+                                   step4_subdir=args.step4_subdir)
         except Exception as e:
             r = {"seg": s, "error": repr(e)[:200]}
         dt = time.time() - t0
