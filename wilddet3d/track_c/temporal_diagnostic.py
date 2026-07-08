@@ -63,10 +63,19 @@ def main():
     ap.add_argument("--val_frac", type=float, default=0.08)
     ap.add_argument("--K", type=int, default=48, help="val trajectories sampled")
     ap.add_argument("--device", default="cuda")
+    # Match the trained model's architecture flags. If wrong, strict-load fails.
+    ap.add_argument("--use_temporal_kv_norm", type=int, default=1,
+                    help="LayerNorm on projected temporal KV (added Phase 2)")
+    ap.add_argument("--temporal_multi_token", type=int, default=1,
+                    help="Multi-token temporal cross-attn over the whole trajectory")
     args = ap.parse_args()
     torch.manual_seed(0)
 
-    refiner = TrackCRefiner(reg_residual_from_prior=False).to(args.device)
+    refiner = TrackCRefiner(
+        reg_residual_from_prior=False,
+        use_temporal_kv_norm=bool(args.use_temporal_kv_norm),
+        temporal_multi_token=bool(args.temporal_multi_token),
+    ).to(args.device)
     sd = torch.load(args.ckpt, map_location="cpu", weights_only=False)["refiner"]
     refiner.load_state_dict(sd, strict=True)
     refiner.eval()

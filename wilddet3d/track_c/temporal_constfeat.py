@@ -35,7 +35,11 @@ from wilddet3d.track_c.losses import geodesic_rotation_loss
 
 
 def load_refiner(ckpt, device):
-    r = TrackCRefiner(reg_residual_from_prior=False).to(device)
+    r = TrackCRefiner(
+        reg_residual_from_prior=False,
+        use_temporal_kv_norm=True,
+        temporal_multi_token=True,
+    ).to(device)
     sd = torch.load(ckpt, map_location="cpu", weights_only=False)["refiner"]
     r.load_state_dict(sd, strict=True)
     r.eval()
