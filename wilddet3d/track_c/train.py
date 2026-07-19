@@ -101,6 +101,10 @@ def evaluate(refiner, loader, dev):
     nfr = 0
     for pack in loader:
         pack = to_dev(pack, dev)
+        # bf16 cache tensors + fp32 LayerNorm params crash on torch>=2.11
+        # (B300 upgrade 2026-07-08). Cast to fp32 in eval — see train_combined.py.
+        for k in ("hidden", "ray", "depth"):
+            pack[k] = pack[k].float()
         out, _ = forward_loss(refiner, pack, {})
         gt_c, gt_d = pack["gt_center"], pack["gt_dims"]
         gt_R = quaternion_to_matrix(pack["gt_quat"])

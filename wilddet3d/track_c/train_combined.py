@@ -93,6 +93,13 @@ def evaluate_single(refiner, loader, dev):
     nfr = 0
     for pack in loader:
         pack = to_dev(pack, dev)
+        # Cache stores hidden/ray/depth in bf16 (CPU-transfer speed); training
+        # autocasts around the forward. Eval doesn't autocast, and torch >=2.11
+        # (B300 upgrade 2026-07-08) no longer silently promotes bf16 activations
+        # for fp32 LayerNorm params → RuntimeError. Cast to fp32 here; works on
+        # both old and new torch, keeps eval math in fp32 (no accuracy risk).
+        for k in ("hidden", "ray", "depth"):
+            pack[k] = pack[k].float()
         out, _ = forward_loss(refiner, pack, {})
         gt_c, gt_d = pack["gt_center"], pack["gt_dims"]
         gt_R = quaternion_to_matrix(pack["gt_quat"])
