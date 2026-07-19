@@ -214,6 +214,15 @@ def main():
     ap.add_argument("--spec_cutoff_period", type=float, default=4.0)
     ap.add_argument("--spec_delta_mm", type=float, default=50.0)
     ap.add_argument("--spec_l9b_margin", type=float, default=0.05)
+    ap.add_argument("--warmup_steps", type=int, default=200,
+                    help="linear LR warmup over this many optimizer steps "
+                         "(then cosine). Set 0 to disable. Guards against "
+                         "the initial-domain-shock NaN when the pretrained "
+                         "head produces catastrophic predictions on new caches.")
+    ap.add_argument("--skip_bad_steps", type=int, default=1,
+                    help="skip optimizer step (and grad reset) if loss is "
+                         "NaN or inf. Prevents one bad batch from corrupting "
+                         "all subsequent weights.")
     ap.add_argument("--eval_every", type=int, default=1)
     ap.add_argument("--auto_resume", type=int, default=1)
     ap.add_argument("--device", default="cuda")
@@ -292,7 +301,23 @@ def main():
           f"temporal={sum(p.numel() for p in temporal_params)/1e6:.2f}M "
           f"(temporal lr x{args.gate_lr_mult})", flush=True)
     total_steps = args.epochs * max(1, len(train_ds) // args.batch_trajs)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, total_steps))
+    # Warmup guards against initial-domain-shock NaN when the pretrained head
+    # produces catastrophic predictions on a new cache distribution. Linear
+    # ramp for `warmup_steps` then cosine for the rest.
+    if args.warmup_steps > 0 and args.warmup_steps < total_steps:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            opt, start_factor=1e-3, end_factor=1.0, total_iters=args.warmup_steps)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=max(1, total_steps - args.warmup_steps))
+        sched = torch.optim.lr_scheduler.SequentialLR(
+            opt, schedulers=[warmup, cosine], milestones=[args.warmup_steps])
+        print(f"[build] LR schedule: linear-warmup {args.warmup_steps} steps "
+              f"(1e-3x -> 1x) then cosine over {total_steps - args.warmup_steps} steps",
+              flush=True)
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, total_steps))
+        print(f"[build] LR schedule: cosine over {total_steps} steps (no warmup)",
+              flush=True)
     loss_kw = dict(w_center=args.w_center, w_depth=args.w_depth,
                     w_dims=args.w_dims, w_rot=args.w_rot)
 
@@ -394,6 +419,21 @@ def main():
                         spec_delta_mm=args.spec_delta_mm,
                         spec_l9b_margin=args.spec_l9b_margin)
                     total = total + plog["loss"]
+            # NaN guard: check loss BEFORE backward. If a single batch's loss
+            # is NaN/inf, do NOT backward — otherwise NaN gradients corrupt
+            # weights and every subsequent step is NaN too (bf16 autocast is
+            # susceptible during the initial-domain-shock period). Skipping
+            # is a no-op equivalent to picking a different batch; scheduler
+            # still advances so LR progression is unchanged.
+            if args.skip_bad_steps and not torch.isfinite(total).item():
+                if nstep < 10 or nstep % 100 == 0:
+                    print(f"[skip] step {nstep}: non-finite loss={float(total):.4g} "
+                          f"(center={float(loss['loss_center']):.3g} "
+                          f"depth={float(loss['loss_depth']):.3g})", flush=True)
+                opt.zero_grad(); sched.step()
+                nstep += 1; logs = loss; dlogs = dlog
+                plogs = plog if plog is not None else plogs
+                continue
             total.backward()
             torch.nn.utils.clip_grad_norm_(
                 [p for p in refiner.parameters() if p.requires_grad], 5.0)
