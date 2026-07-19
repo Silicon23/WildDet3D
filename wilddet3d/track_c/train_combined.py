@@ -435,8 +435,19 @@ def main():
                 plogs = plog if plog is not None else plogs
                 continue
             total.backward()
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 [p for p in refiner.parameters() if p.requires_grad], 5.0)
+            # Grad-finite check: loss can be finite while individual grads NaN
+            # (bf16 autocast + rare intermediate saturations). grad_norm is NaN
+            # iff any grad is NaN. Skip step to keep optimizer state clean.
+            if args.skip_bad_steps and not torch.isfinite(grad_norm).item():
+                if nstep < 10 or nstep % 100 == 0:
+                    print(f"[skip] step {nstep}: non-finite grad_norm={float(grad_norm):.4g}",
+                          flush=True)
+                opt.zero_grad(); sched.step()
+                nstep += 1; logs = loss; dlogs = dlog
+                plogs = plog if plog is not None else plogs
+                continue
             opt.step(); sched.step(); opt.zero_grad()
             running += float(total); nstep += 1; logs = loss; dlogs = dlog
             plogs = plog if plog is not None else plogs
