@@ -25,9 +25,12 @@ def list_cached_trajectories(cache_dir: str) -> List[str]:
 
 
 CANONICAL_VAL_SPLIT = (
-    "/weka/oe-training-default/weikaih/3d_boundingbox_detection/video_3d_box/"
-    "itw_3dbox_det/outputs/track_c/val_split.json"
+    "/weka/oe-training-default/jasonr/3d_box/3d_boundingbox_detection/"
+    "video_3d_box/itw_3dbox_det/outputs/track_c/val_split.json"
 )
+# NOTE 2026-07-08: repointed weikaih -> jasonr/3d_box after the workspace
+# migration. The old path silently didn't exist, causing RNG-fallback splits
+# on any run that didn't pass --val_split_file explicitly (e.g. WX3_adt).
 
 
 def split_by_video(traj_paths: List[str], val_frac: float = 0.05, seed: int = 0,
@@ -177,6 +180,144 @@ class VideoGroupedSampler(Sampler):
 
     def __len__(self):
         return len(self.ds)
+
+
+# ----------------------------------------------------------------------
+# COMBINED (multi-source) training: CA-1M + Waymo + ADT with within-batch mix
+# ----------------------------------------------------------------------
+
+class CombinedTrackCDataset(Dataset):
+    """Wraps N per-dataset CachedTrackCDatasets under a single flat index.
+
+    Each source is filtered by category (via pairing_index if provided) and
+    split-by-video with its own val_split_file. Only the TRAIN split is
+    exposed by this class; build separate val CachedTrackCDatasets per source
+    for the multi-val eval loop.
+
+    Layout in flat-index space (offsets):
+        [0 .. len(src0)) [len(src0) .. len(src0)+len(src1)) ...
+    """
+
+    def __init__(self, sources, preload: bool = True):
+        """sources: list of dicts, each with keys
+           name, cache_dir, val_split_file (may be None/"" for RNG),
+           pairing_index (optional), categories (comma str, optional),
+           val_frac (default 0.05), seed (default 0)."""
+        import json as _json
+        self.sources = []          # list[CachedTrackCDataset] (train paths only)
+        self.names = []            # parallel list[str]
+        self.offsets = [0]         # length N+1
+        self.per_source_val_paths = {}  # name -> list[str] (for building val loaders)
+        self.per_source_all_paths = {}  # name -> list[str] (for reference)
+        for s in sources:
+            paths = list_cached_trajectories(s["cache_dir"])
+            if s.get("categories") and s.get("pairing_index"):
+                keep = set(c.strip() for c in s["categories"].split(",") if c.strip())
+                cat_of = {}
+                for line in open(s["pairing_index"]):
+                    d = _json.loads(line)
+                    cat_of[f"{d['seg']}__{d['track_id']}"] = d["category"]
+                paths = [p for p in paths
+                         if cat_of.get(os.path.basename(p)[:-3]) in keep]
+            split_kw = ({} if s.get("val_split_file") is None
+                        else {"split_file": s["val_split_file"]})
+            train_paths, val_paths, _ = split_by_video(
+                paths, s.get("val_frac", 0.05),
+                seed=s.get("seed", 0), **split_kw)
+            ds = CachedTrackCDataset(s["cache_dir"], train_paths, preload=preload)
+            self.sources.append(ds)
+            self.names.append(s["name"])
+            self.offsets.append(self.offsets[-1] + len(ds))
+            self.per_source_val_paths[s["name"]] = val_paths
+            self.per_source_all_paths[s["name"]] = paths
+            print(f"[combined] {s['name']}: {len(paths)} filtered trajs -> "
+                  f"train {len(train_paths)} / val {len(val_paths)}", flush=True)
+        self.total = self.offsets[-1]
+
+    def __len__(self):
+        return self.total
+
+    def _resolve(self, i: int):
+        # linear scan is fine for N<=8 sources; binary search wouldn't help
+        for k in range(len(self.sources)):
+            if i < self.offsets[k + 1]:
+                return k, i - self.offsets[k]
+        raise IndexError(i)
+
+    def __getitem__(self, i: int) -> dict:
+        k, li = self._resolve(i)
+        pack = self.sources[k][li]
+        pack["dataset_name"] = self.names[k]
+        return pack
+
+    def traj_T(self, i: int) -> int:
+        k, li = self._resolve(i)
+        return self.sources[k].traj_T(li)
+
+    def video_of(self, i: int) -> str:
+        k, li = self._resolve(i)
+        return f"{self.names[k]}:{self.sources[k].video_of(li)}"
+
+
+class WeightedMultiSourceSampler(Sampler):
+    """Yield flat indices into a CombinedTrackCDataset with within-batch
+    weighted mixing. Each yield picks a source with prob proportional to
+    weights, then draws a randomly-shuffled index from that source's queue
+    (refilled on exhaustion). One epoch = total combined dataset size.
+    """
+
+    def __init__(self, combined_ds: CombinedTrackCDataset,
+                 weights: List[float], shuffle: bool = True, seed: int = 0):
+        assert len(weights) == len(combined_ds.sources), (
+            f"weights ({len(weights)}) must match sources ({len(combined_ds.sources)})")
+        self.cds = combined_ds
+        w = torch.tensor(weights, dtype=torch.float64)
+        assert (w > 0).all(), f"weights must be positive: {weights}"
+        self.weights = (w / w.sum()).tolist()
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, e: int):
+        self.epoch = e
+
+    def __iter__(self):
+        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        n_src = len(self.cds.sources)
+        # per-source shuffled queues; refill when empty so no source starves
+        queues = []
+        for k in range(n_src):
+            ds = self.cds.sources[k]
+            if self.shuffle:
+                perm = torch.randperm(len(ds), generator=g).tolist()
+            else:
+                perm = list(range(len(ds)))
+            queues.append(perm)
+        total = len(self.cds)
+        source_seq = torch.multinomial(
+            torch.tensor(self.weights), num_samples=total,
+            replacement=True, generator=g).tolist()
+        for k in source_seq:
+            if not queues[k]:
+                perm = torch.randperm(len(self.cds.sources[k]),
+                                      generator=g).tolist()
+                queues[k] = perm
+            local_i = queues[k].pop()
+            yield self.cds.offsets[k] + local_i
+
+    def __len__(self):
+        return len(self.cds)
+
+
+def build_per_source_val_datasets(combined_ds: CombinedTrackCDataset,
+                                   preload: bool = True):
+    """Return {name: CachedTrackCDataset} for the val split of each source."""
+    out = {}
+    for i, name in enumerate(combined_ds.names):
+        src = combined_ds.sources[i]
+        val_paths = combined_ds.per_source_val_paths[name]
+        out[name] = CachedTrackCDataset(src.cache_dir, val_paths, preload=preload)
+    return out
 
 
 def collate_trajs(packs: list) -> dict:
