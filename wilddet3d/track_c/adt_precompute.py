@@ -32,7 +32,7 @@ from pycocotools import mask as pycoco_mask
 
 from wilddet3d.track_c.data import _camera_box_repr, _interp_box_repr, _quat_wxyz_from_R
 from wilddet3d.track_c.feature_extractor import FrozenFeatureExtractor
-from wilddet3d.track_c.precompute import _atomic_save
+from wilddet3d.track_c.precompute import _atomic_save, _load_or_new_frame_cache
 from wilddet3d.track_c.waymo_precompute import _gt_box2d_from_obj
 
 
@@ -156,7 +156,8 @@ def precompute_segment(ext, outputs_dir, seg, cache_dir, categories, index_objs,
         open(done_marker, "w").close()
         return {"seg": seg, "n_obj": 0}
 
-    frame_cache = {}
+    # merge: preserve step1 indices cached by prior passes (see precompute.py).
+    frame_cache = _load_or_new_frame_cache(f"{cache_dir}/frames/{seg}.pt")
     per_obj = {obj: [] for obj in objs}
 
     all_idx = sorted(gt_by_frame.keys())

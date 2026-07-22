@@ -48,6 +48,30 @@ def _atomic_save(obj, path):
     os.replace(tmp, path)
 
 
+def _load_or_new_frame_cache(path):
+    """Read an existing frames.pt if present, else start empty.
+
+    Precompute writes {step1_index: {...}} dicts. When a video is re-processed
+    (e.g. adding a new category's tracks), previously-cached step1 indices for
+    other tracks in the same video MUST be preserved — otherwise the saved
+    frames.pt drops frames referenced by pre-existing traj files and readers
+    hit KeyError. Merge on write instead of overwriting.
+
+    2026-07-22 bug fix: the ped precompute silently dropped ~16% of Waymo
+    veh+cyc frame indices because it rewrote frames.pt with only ped-referenced
+    step1 indices. Regression test lives in tests/test_frame_cache_merge.py.
+    """
+    if not os.path.exists(path):
+        return {}
+    try:
+        existing = torch.load(path, weights_only=False)
+        if isinstance(existing, dict):
+            return existing
+    except Exception:
+        pass
+    return {}
+
+
 def precompute_video(ext, outputs_dir, video_id, cache_dir,
                      ca1m_videos_dir=None, step1_dir=None, max_frames=None):
     ca1m_videos_dir = ca1m_videos_dir or f"{outputs_dir}/ca1m_extracted/videos"
@@ -87,7 +111,8 @@ def precompute_video(ext, outputs_dir, video_id, cache_dir,
     K_all = np.load(f"{step1_dir}/intrinsics.npy")
     end = min(end, n_frames)
 
-    frame_cache = {}                      # step1_index -> {depth_latents, ray, K, input_hw}
+    frame_cache = _load_or_new_frame_cache(
+        f"{cache_dir}/frames/{video_id}.pt")   # merge: preserve frames from prior passes
     per_obj = {obj: [] for obj in priors}  # obj -> list of frame records
 
     for idx in range(start, end):
