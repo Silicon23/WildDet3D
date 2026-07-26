@@ -1,4 +1,4 @@
-"""Build exact point-prompt Track C caches for one v2 production unit.
+"""Build canonical point-prompt Track C caches for one v2 production unit.
 
 One invocation processes a single sequence/unit.  It consumes the authoritative
 target-complete v2 pair shards and the frozen Stage-4 aggregate
@@ -7,8 +7,17 @@ target-complete v2 pair shards and the frozen Stage-4 aggregate
 * every tensor file is written with temporary-file + rename;
 * ``.done/<variant>__<dataset>__<unit>.json`` is the sole completion marker;
 * a preempted unit is recomputed, never inferred complete from partial files;
-* the frozen forward is accepted only if its final box/score agrees with the
-  original Stage-4 record.
+* every Stage-4 prompt in a frame participates in replay, including
+  prompts excluded upstream by CA-1M's suitability policy;
+* prompt-independent repeated-image features are deduplicated only within one
+  actual forward chunk, because BF16 kernels can change them with batch size;
+* replay-vs-raw deltas are retained as diagnostics, not used to filter rows.
+
+The last point is deliberate. Original Stage-4 jobs mixed H100 and B300 kernels
+and did not record OOM-bisected effective batch sizes, so exact cross-hardware
+replay is not recoverable for every row. The raw v2 box remains the temporal
+prior; the newly replayed hidden/depth/2D anchor form a self-consistent frozen
+visual observation for the direct-output refiner.
 """
 
 from __future__ import annotations
@@ -149,26 +158,18 @@ def _qa_prediction(
         "score_2d": score_2d_delta,
         "score_3d": score_3d_delta,
     }
-    limits = {
-        "center_m": 2e-3,
-        "dims_m": 2e-3,
-        "quat_abs": 2e-3,
-        "box2d_px": 0.12,
-        "score": 2e-3,
-        "score_2d": 2e-3,
-        "score_3d": 2e-3,
-    }
-    failures = {
-        name: (deltas[name], limit)
-        for name, limit in limits.items()
-        if deltas[name] > limit
-    }
-    if failures:
-        raise RuntimeError(
-            f"frozen forward disagrees with raw record "
-            f"{raw['track_id']} frame={raw['frame_index']}: {failures}"
-        )
     return deltas
+
+
+RAW_REPLAY_TOLERANCES = {
+    "center_m": 2e-3,
+    "dims_m": 2e-3,
+    "quat_abs": 2e-3,
+    "box2d_px": 0.12,
+    "score": 2e-3,
+    "score_2d": 2e-3,
+    "score_3d": 2e-3,
+}
 
 
 def _trajectory_filename(prefix: str, track_id: str) -> str:
@@ -289,10 +290,18 @@ def process_unit(
     vggt_dir = Path(meta["vggt_dir"])
     scale = float(meta["scale_value"])
 
-    grouped: dict[tuple[int, str], list[tuple[dict, dict]]] = collections.defaultdict(list)
-    for key, pair in pair_by_key.items():
-        raw = raw_by_key[key]
-        if str(raw["category"]) != str(pair["category"]):
+    grouped: dict[int, list[tuple[dict | None, dict]]] = collections.defaultdict(
+        list
+    )
+    # Preserve predictions.jsonl order. CA-1M's target corpus deliberately
+    # excludes unsuitable tracks, but those prompts were present in the
+    # original same-text Stage-4 batches and therefore remain replay context.
+    for raw in raw_rows:
+        if raw.get("status") != "ok":
+            continue
+        key = (str(raw["track_id"]), int(raw["frame_index"]))
+        pair = pair_by_key.get(key)
+        if pair is not None and str(raw["category"]) != str(pair["category"]):
             raise ValueError(f"category mismatch for {key}")
         # Stage 4 groups and prompts with the manifest text_prompt, which is
         # intentionally not always the dataset category (Waymo pedestrian ->
@@ -301,18 +310,20 @@ def process_unit(
         text_prompt = str(raw["text_prompt"])
         if str(raw["prompt_text"]) != f"geometric: {text_prompt}":
             raise ValueError(f"prompt text contract mismatch for {key}")
-        grouped[(int(raw["vggt_frame_index"]), text_prompt)].append(
-            (pair, raw)
-        )
+        grouped[int(raw["vggt_frame_index"])].append((pair, raw))
 
     frame_cache: dict[int, dict[str, Any]] = {}
     prompt_features: dict[tuple[str, int], dict[str, Any]] = {}
     max_qa = collections.defaultdict(float)
+    raw_replay_within_tolerance = 0
     n_forwards = 0
+    replay_context_prompts = 0
     n_frame_feature_rechecks = 0
+    max_within_forward_feature_delta = collections.defaultdict(float)
+    max_across_group_feature_delta = collections.defaultdict(float)
     input_hw: tuple[int, int] | None = None
 
-    for (vggt_index, label), entries in sorted(grouped.items()):
+    for vggt_index, entries in sorted(grouped.items()):
         image_path = vggt_dir / "frames" / f"{vggt_index:06d}.jpg"
         depth_path = vggt_dir / "depth" / f"{vggt_index:06d}.npy"
         image = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.float32)
@@ -320,6 +331,10 @@ def process_unit(
         K = np.asarray(entries[0][1]["intrinsics"], dtype=np.float32)
         for offset in range(0, len(entries), max_prompts_per_forward):
             chunk = entries[offset : offset + max_prompts_per_forward]
+            target_count = sum(pair is not None for pair, _ in chunk)
+            if target_count == 0:
+                continue
+            replay_context_prompts += len(chunk) - target_count
             points = [
                 [
                     (float(x), float(y), 1)
@@ -327,11 +342,12 @@ def process_unit(
                 ]
                 for _, raw in chunk
             ]
+            labels = [str(raw["text_prompt"]) for _, raw in chunk]
             features = extractor.extract(
                 image=image,
                 intrinsics=K,
                 points_xy_label=points,
-                label=label,
+                label=labels,
                 depth_m=depth_m,
                 amp_dtype=amp_dtype,
             )
@@ -344,11 +360,40 @@ def process_unit(
                     f"{input_hw} vs {features['input_hw']}"
                 )
 
+            depth_batch = features["depth_latents"]
+            ray_batch = features["ray_embeddings"]
+            if depth_batch.shape[0] != len(chunk) or ray_batch.shape[0] != len(chunk):
+                raise RuntimeError(
+                    "forward feature batch does not align with prompt chunk: "
+                    f"depth={tuple(depth_batch.shape)} ray={tuple(ray_batch.shape)} "
+                    f"prompts={len(chunk)}"
+                )
+            for name, value in (
+                ("depth_latents", depth_batch),
+                ("ray", ray_batch),
+            ):
+                delta = float(
+                    (value.float() - value[:1].float()).abs().max()
+                )
+                max_within_forward_feature_delta[name] = max(
+                    max_within_forward_feature_delta[name], delta
+                )
+                if delta > 2e-3:
+                    raise RuntimeError(
+                        f"repeated-image {name} differs within one prompt batch: "
+                        f"unit={unit} frame={vggt_index} labels={labels!r} "
+                        f"chunk={offset // max_prompts_per_forward} delta={delta}"
+                    )
+
             frame_value = {
-                "depth_latents": features["depth_latents"],
-                "ray": features["ray_embeddings"],
+                # Clone the selected batch view. Without this, torch.save keeps
+                # the full prompt-batch backing storage for every frame and
+                # silently inflates caches by up to max_prompts_per_forward.
+                "depth_latents": depth_batch[0].clone(),
+                "ray": ray_batch[0].clone(),
                 "K": features["intrinsics"],
                 "input_hw": features["input_hw"],
+                "vggt_frame_index": vggt_index,
             }
             if vggt_index not in frame_cache:
                 frame_cache[vggt_index] = frame_value
@@ -359,13 +404,20 @@ def process_unit(
                     delta = float(
                         (old[name].float() - frame_value[name].float()).abs().max()
                     )
+                    max_across_group_feature_delta[name] = max(
+                        max_across_group_feature_delta[name], delta
+                    )
                     if delta > 2e-3:
                         raise RuntimeError(
-                            f"shared frame feature {name} depends on prompt group: "
-                            f"unit={unit} frame={vggt_index} delta={delta}"
+                            f"shared-image {name} depends on prompt group: "
+                            f"unit={unit} frame={vggt_index} labels={labels!r} "
+                            f"delta={delta}"
                         )
+            feature_slot = vggt_index
 
             for i, (pair, raw) in enumerate(chunk):
+                if pair is None:
+                    continue
                 qa = _qa_prediction(
                     raw,
                     features["final_box_2d_xyxy"][i],
@@ -376,6 +428,12 @@ def process_unit(
                 )
                 for name, value in qa.items():
                     max_qa[name] = max(max_qa[name], value)
+                raw_replay_within_tolerance += int(
+                    all(
+                        qa[name] <= limit
+                        for name, limit in RAW_REPLAY_TOLERANCES.items()
+                    )
+                )
                 key = (str(pair["track_id"]), int(pair["frame_index"]))
                 prompt_features[key] = {
                     "hidden": features["hidden_states"][:, i, :],
@@ -385,6 +443,7 @@ def process_unit(
                         "sel_n_positive_inside"
                     ][i],
                     "vggt_frame_index": vggt_index,
+                    "feature_slot": feature_slot,
                 }
 
     if len(prompt_features) != len(pairs):
@@ -425,7 +484,7 @@ def process_unit(
             timestamp_source = "source_timestamp_ns"
 
         trajectory = {
-            "schema_version": "v2_track_c_cache_v1",
+            "schema_version": "v2_track_c_cache_v2",
             "prompt_variant": variant,
             "prompt_variant_id": VARIANT_TO_ID[variant],
             "dataset": dataset,
@@ -442,6 +501,10 @@ def process_unit(
             ),
             "vggt_frame_index": torch.tensor(
                 [prompt_features[key]["vggt_frame_index"] for key in keys],
+                dtype=torch.long,
+            ),
+            "feature_slot": torch.tensor(
+                [prompt_features[key]["feature_slot"] for key in keys],
                 dtype=torch.long,
             ),
             "ts_sec": torch.tensor(timestamps_sec, dtype=torch.float32),
@@ -479,7 +542,7 @@ def process_unit(
         trajectory_paths.append(str(traj_path))
 
     result = {
-        "schema_version": "v2_track_c_cache_v1",
+        "schema_version": "v2_track_c_cache_v2",
         "status": "done",
         "prompt_variant": variant,
         "prompt_variant_id": VARIANT_TO_ID[variant],
@@ -488,11 +551,27 @@ def process_unit(
         "pairs": len(pairs),
         "tracks": len(by_track),
         "unique_vggt_frames": len(frame_cache),
+        "feature_cache_slots": len(frame_cache),
         "prompt_groups": len(grouped),
         "model_forwards": n_forwards,
+        "replay_context_prompts": replay_context_prompts,
         "shared_frame_feature_rechecks": n_frame_feature_rechecks,
+        "raw_replay_within_tolerance": raw_replay_within_tolerance,
+        "raw_replay_total": len(pairs),
+        "raw_replay_tolerances": RAW_REPLAY_TOLERANCES,
+        "max_within_forward_feature_delta": dict(
+            sorted(max_within_forward_feature_delta.items())
+        ),
+        "max_across_group_feature_delta": dict(
+            sorted(max_across_group_feature_delta.items())
+        ),
         "input_hw": list(input_hw) if input_hw else None,
-        "max_raw_record_delta": dict(sorted(max_qa.items())),
+        "max_raw_record_delta_diagnostic": dict(sorted(max_qa.items())),
+        "replay_contract": (
+            "all raw frame prompts in canonical shared-image multi-label chunks; "
+            "raw Stage-4 box is the temporal prior; replay hidden/depth/2D box "
+            "is the self-consistent visual observation"
+        ),
         "pairs_path": str(pairs_unit),
         "pairs_sha256": sha256_file(pairs_unit),
         "predictions_path": str(pred_path),

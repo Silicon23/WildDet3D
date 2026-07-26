@@ -188,8 +188,13 @@ class V2CachedTrackDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         trajectory = self.records[index]
         frame_cache = self.frame_store.get(trajectory["video_key"])
-        frame_indices = trajectory["vggt_frame_index"].tolist()
-        frames = [frame_cache[int(frame_index)] for frame_index in frame_indices]
+        if trajectory.get("schema_version") != "v2_track_c_cache_v2":
+            raise ValueError(
+                f"unsupported trajectory cache schema in "
+                f"{trajectory['video_key']}: {trajectory.get('schema_version')}"
+            )
+        feature_slots = trajectory["feature_slot"].tolist()
+        frames = [frame_cache[int(slot)] for slot in feature_slots]
         input_hw = tuple(int(x) for x in frames[0]["input_hw"])
         if any(tuple(frame["input_hw"]) != input_hw for frame in frames):
             raise ValueError(f"input_hw changes in {trajectory['video_key']}")

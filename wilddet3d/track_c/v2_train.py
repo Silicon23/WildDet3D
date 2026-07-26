@@ -60,7 +60,7 @@ AUTHORITATIVE_COMBINED = {
 
 
 def validate_cache_completion(
-    cache_root: Path, pairs_root: Path
+    cache_root: Path, pairs_root: Path, verification_root: Path
 ) -> dict[str, Any]:
     """Fail closed unless the cache exactly covers both finalized manifests."""
     expected: dict[str, tuple[Path, str]] = {}
@@ -68,7 +68,9 @@ def validate_cache_completion(
     report_tracks = 0
     for variant in ("point_v3", "point_vlm_v1"):
         variant_dir = pairs_root / variant
-        verification_path = variant_dir / "track_c_verification.json"
+        verification_path = (
+            verification_root / variant / "track_c_verification.json"
+        )
         if not verification_path.is_file():
             raise FileNotFoundError(
                 f"target manifest is not finalized: {verification_path}"
@@ -125,7 +127,10 @@ def validate_cache_completion(
     for key, marker_path in observed.items():
         with marker_path.open() as handle:
             marker = json.load(handle)
-        if marker.get("status") != "done":
+        if (
+            marker.get("status") != "done"
+            or marker.get("schema_version") != "v2_track_c_cache_v2"
+        ):
             raise ValueError(f"non-done marker {marker_path}")
         if (
             f"{marker['prompt_variant']}__{marker['dataset']}__{marker['unit_id']}"
@@ -517,6 +522,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cache_root", type=Path, required=True)
     parser.add_argument("--pairs_root", type=Path, required=True)
+    parser.add_argument("--verification_root", type=Path, required=True)
     parser.add_argument("--out_dir", type=Path, required=True)
     parser.add_argument("--split_file", type=Path)
     parser.add_argument(
@@ -561,7 +567,7 @@ def main() -> None:
 
     print("[data] verifying exact cache completion", flush=True)
     cache_verification = validate_cache_completion(
-        args.cache_root, args.pairs_root
+        args.cache_root, args.pairs_root, args.verification_root
     )
     print(
         "[data] exact cache "

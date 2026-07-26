@@ -1,7 +1,7 @@
-"""Exact frozen-feature extraction for v2 positive-point WildDet3D tracks.
+"""Canonical frozen-feature replay for v2 positive-point WildDet3D tracks.
 
-Unlike the original Track C cache (GT-box prompts), v2 must reproduce the
-point-prompted Stage-4 forward exactly:
+Unlike the original Track C cache (GT-box prompts), v2 replays the
+point-prompted Stage-4 frozen stack with:
 
 * one repeated image per positive-point prompt,
 * shared category-conditioned ``prompt_text="geometric: <label>"``,
@@ -9,9 +9,10 @@ point-prompted Stage-4 forward exactly:
 * Stage-4 score/NMS followed by point-containment proposal routing.
 
 The selected decoder query is recovered from the raw model tensors by
-replaying that routing.  The final public prediction is returned as a QA
-oracle so cache production can compare it field-for-field with the frozen v2
-record before accepting any feature.
+replaying that routing. The final public prediction is returned for measuring
+replay drift against the frozen v2 record. Bitwise reproduction is not assumed:
+the production corpus spans GPU architectures and did not persist OOM-adjusted
+batch sizes or deterministic-kernel state.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import torch
 from torch import Tensor
 from torchvision.ops import batched_nms
 
-from wilddet3d.data_types import WildDet3DInput
+from wilddet3d.data_types import Det3DOut, WildDet3DInput
 from wilddet3d.inference import (
     _orig_to_input_hw_point,
     build_model,
@@ -34,7 +35,7 @@ from wilddet3d.preprocessing import preprocess
 
 
 def patch_predictor_point_batching(predictor) -> None:
-    """Apply the exact repeated-image point batching used by v2 Stage 4."""
+    """Support both production's repeated images and canonical shared images."""
 
     def _create_point_batch_patched(
         self,
@@ -63,10 +64,18 @@ def patch_predictor_point_batching(predictor) -> None:
                 )
                 geo_point_labels[i, j] = int(label)
                 geo_points_mask[i, j] = False
+        # Production repeated one image per prompt as a predictor-wrapper
+        # workaround. Canonical Track C replay may instead pass one shared
+        # image; WildDet3D natively maps all prompts to it through img_ids.
+        img_ids = (
+            torch.zeros(n_prompts, dtype=torch.long, device=device)
+            if images.shape[0] == 1
+            else torch.arange(n_prompts, dtype=torch.long, device=device)
+        )
         return WildDet3DInput(
             images=images,
             intrinsics=intrinsics,
-            img_ids=torch.arange(n_prompts, dtype=torch.long, device=device),
+            img_ids=img_ids,
             text_ids=torch.zeros(n_prompts, dtype=torch.long, device=device),
             unique_texts=[text],
             geo_points=geo_points,
@@ -184,7 +193,7 @@ def _select_raw_queries(
 
 
 class V2PointFeatureExtractor:
-    """Frozen WildDet3D wrapper that exposes exact selected-query features."""
+    """Frozen WildDet3D wrapper that exposes selected-query features."""
 
     def __init__(
         self,
@@ -228,23 +237,32 @@ class V2PointFeatureExtractor:
         image: np.ndarray,
         intrinsics: np.ndarray,
         points_xy_label: Sequence[Sequence[tuple[float, float, int]]],
-        label: str,
+        label: str | Sequence[str],
         depth_m: np.ndarray,
         amp_dtype: str = "bf16",
     ) -> dict:
-        """Run an exact v2 point-prompt group and return CPU cache tensors."""
+        """Run a canonical v2 point-prompt group and return CPU cache tensors."""
         if not points_xy_label or any(not points for points in points_xy_label):
             raise ValueError("every prompt needs at least one point")
+        labels = (
+            [label] * len(points_xy_label)
+            if isinstance(label, str)
+            else list(label)
+        )
+        if len(labels) != len(points_xy_label) or any(not value for value in labels):
+            raise ValueError("one nonempty text label is required per prompt")
         image = np.asarray(image).astype(np.float32)
         intrinsics = np.asarray(intrinsics).astype(np.float32)
         depth_m = np.asarray(depth_m).astype(np.float32)
         data = preprocess(image, intrinsics, depth=depth_m)
         height, width = data["input_hw"]
         n_prompts = len(points_xy_label)
-        images = data["images"].to(self.device).repeat(n_prompts, 1, 1, 1)
-        K = data["intrinsics"].to(self.device)[None].repeat(n_prompts, 1, 1)
-        depth_gt = data["depth_gt"].to(self.device).repeat(n_prompts, 1, 1, 1)
-        input_hw = [data["input_hw"]] * n_prompts
+        # Compute the frozen image/depth stack once, then map every point prompt
+        # to that shared image. This is WildDet3D's native prompt representation
+        # and the same contract used by v1 Track C feature extraction.
+        images = data["images"].to(self.device)
+        K = data["intrinsics"].to(self.device)[None]
+        depth_gt = data["depth_gt"].to(self.device)
         original_hw = [data["original_hw"]] * n_prompts
         padding = [data["padding"]] * n_prompts
         points = [
@@ -286,7 +304,11 @@ class V2PointFeatureExtractor:
                     value = args[index]
                 if value is not None:
                     captured[name] = value
-            return original_forward_test(*args, **kwargs)
+            # Cache extraction consumes the captured raw tensors directly.
+            # Avoid the expensive public NMS/decode path, especially when a
+            # canonical frame batch contains several differently labeled
+            # prompts.
+            return Det3DOut([], [], [], [], None)
 
         def head_pre_hook(module, args, kwargs):
             captured["ray_embeddings"] = (
@@ -308,28 +330,56 @@ class V2PointFeatureExtractor:
         }[amp_dtype]
         try:
             if dtype is None or self.device.type != "cuda":
-                result = self.predictor(
-                    images=images,
-                    intrinsics=K,
-                    input_hw=input_hw,
-                    original_hw=original_hw,
-                    padding=padding,
-                    input_points=points,
-                    prompt_text=f"geometric: {label}",
-                    depth_gt=depth_gt,
+                batch = self.predictor._create_point_batch(
+                    images,
+                    K,
+                    points_model,
+                    (height, width),
+                    self.device,
+                    text="geometric",
+                    padding=[data["padding"]],
                 )
+                unique_texts = list(
+                    dict.fromkeys(f"geometric: {value}" for value in labels)
+                )
+                text_to_id = {
+                    value: index for index, value in enumerate(unique_texts)
+                }
+                batch.unique_texts = unique_texts
+                batch.text_ids = torch.tensor(
+                    [text_to_id[f"geometric: {value}"] for value in labels],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                batch.original_hw = [data["original_hw"]]
+                batch.depth_gt = depth_gt
+                self.wd(batch)
             else:
                 with torch.autocast(device_type="cuda", dtype=dtype):
-                    result = self.predictor(
-                        images=images,
-                        intrinsics=K,
-                        input_hw=input_hw,
-                        original_hw=original_hw,
-                        padding=padding,
-                        input_points=points,
-                        prompt_text=f"geometric: {label}",
-                        depth_gt=depth_gt,
+                    batch = self.predictor._create_point_batch(
+                        images,
+                        K,
+                        points_model,
+                        (height, width),
+                        self.device,
+                        text="geometric",
+                        padding=[data["padding"]],
                     )
+                    unique_texts = list(
+                        dict.fromkeys(f"geometric: {value}" for value in labels)
+                    )
+                    text_to_id = {
+                        value: index for index, value in enumerate(unique_texts)
+                    }
+                    batch.unique_texts = unique_texts
+                    batch.text_ids = torch.tensor(
+                        [text_to_id[f"geometric: {value}"] for value in labels],
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    batch.original_hw = [data["original_hw"]]
+                    batch.depth_gt = depth_gt
+                    self.wd(batch)
         finally:
             self.wd.sam3._run_decoder = original_decoder
             self.wd._forward_test = original_forward_test
@@ -354,11 +404,40 @@ class V2PointFeatureExtractor:
         ray_embeddings = captured["ray_embeddings"]
         scores, scores_2d, scores_3d = _combined_scores(self.wd, captured)
 
-        final_box2d = torch.stack([boxes[0] for boxes in result[0]])
-        final_box3d = torch.stack([boxes[0] for boxes in result[1]])
-        final_score = torch.stack([values[0] for values in result[2]])
-        final_score_2d = torch.stack([values[0] for values in result[3]])
-        final_score_3d = torch.stack([values[0] for values in result[4]])
+        final_box2d_model = pred_box_norm.clone()
+        final_box2d_model[:, 0::2] *= width
+        final_box2d_model[:, 1::2] *= height
+        encoded_box3d = torch.stack(
+            [captured["pred_boxes_3d"][i, selected[i]] for i in range(n_prompts)]
+        )
+        final_box3d = self.wd.box_coder.decode(
+            final_box2d_model, encoded_box3d, K[0]
+        )
+
+        # Public Stage-4 JSON is in saved/original-frame pixels, while the
+        # decoder anchor remains normalized model-input xyxy.
+        final_box2d = final_box2d_model.clone()
+        orig_h, orig_w = data["original_hw"]
+        pad_left, pad_right, pad_top, pad_bottom = data["padding"]
+        content_w = width - pad_left - pad_right
+        content_h = height - pad_top - pad_bottom
+        final_box2d[:, 0::2] = (
+            final_box2d[:, 0::2] - pad_left
+        ) / (content_w / orig_w)
+        final_box2d[:, 1::2] = (
+            final_box2d[:, 1::2] - pad_top
+        ) / (content_h / orig_h)
+        final_box2d[:, 0::2].clamp_(0, orig_w)
+        final_box2d[:, 1::2].clamp_(0, orig_h)
+        final_score = torch.stack(
+            [scores[i, selected[i]] for i in range(n_prompts)]
+        )
+        final_score_2d = torch.stack(
+            [scores_2d[i, selected[i]] for i in range(n_prompts)]
+        )
+        final_score_3d = torch.stack(
+            [scores_3d[i, selected[i]] for i in range(n_prompts)]
+        )
         routed_score = torch.stack(
             [scores[i, selected[i]] for i in range(n_prompts)]
         )
@@ -379,8 +458,11 @@ class V2PointFeatureExtractor:
             "pred_box_2d": pred_box_norm.detach().float().cpu(),
             "sel_idx": selected.detach().cpu(),
             "sel_n_positive_inside": n_inside,
-            "depth_latents": depth_latents[0].detach().to(torch.bfloat16).cpu(),
-            "ray_embeddings": ray_embeddings[0].detach().to(torch.bfloat16).cpu(),
+            # Keep the prompt batch dimension here. Cache production verifies
+            # that repeated-image features agree within this one forward before
+            # deduplicating them at the forward-chunk level.
+            "depth_latents": depth_latents.detach().to(torch.bfloat16).cpu(),
+            "ray_embeddings": ray_embeddings.detach().to(torch.bfloat16).cpu(),
             "intrinsics": data["intrinsics"].detach().float().cpu(),
             "input_hw": (height, width),
             "final_box_2d_xyxy": final_box2d.detach().float().cpu(),
