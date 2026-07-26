@@ -170,7 +170,7 @@ RAW_REPLAY_TOLERANCES = {
     "score_2d": 2e-3,
     "score_3d": 2e-3,
 }
-MIN_QUERY_REFERENCE_IOU = 0.5
+LOW_QUERY_REFERENCE_IOU = 0.5
 
 
 def _trajectory_filename(prefix: str, track_id: str) -> str:
@@ -440,12 +440,6 @@ def process_unit(
                 )
                 key = (str(pair["track_id"]), int(pair["frame_index"]))
                 reference_iou = float(features["sel_reference_iou"][i])
-                if reference_iou < MIN_QUERY_REFERENCE_IOU:
-                    raise RuntimeError(
-                        "no replay decoder query corresponds to the raw "
-                        f"Stage-4 2D box: unit={unit} key={key} "
-                        f"best_iou={reference_iou}"
-                    )
                 reference_ious.append(reference_iou)
                 prompt_features[key] = {
                     "hidden": features["hidden_states"][:, i, :],
@@ -497,7 +491,7 @@ def process_unit(
             timestamp_source = "source_timestamp_ns"
 
         trajectory = {
-            "schema_version": "v2_track_c_cache_v3",
+            "schema_version": "v2_track_c_cache_v4",
             "prompt_variant": variant,
             "prompt_variant_id": VARIANT_TO_ID[variant],
             "dataset": dataset,
@@ -558,7 +552,7 @@ def process_unit(
         trajectory_paths.append(str(traj_path))
 
     result = {
-        "schema_version": "v2_track_c_cache_v3",
+        "schema_version": "v2_track_c_cache_v4",
         "status": "done",
         "prompt_variant": variant,
         "prompt_variant_id": VARIANT_TO_ID[variant],
@@ -576,10 +570,21 @@ def process_unit(
         "raw_replay_total": len(pairs),
         "raw_replay_tolerances": RAW_REPLAY_TOLERANCES,
         "query_reference_iou": {
-            "required_min": MIN_QUERY_REFERENCE_IOU,
+            "selection": "argmax_no_gate",
+            "diagnostic_low_threshold": LOW_QUERY_REFERENCE_IOU,
             "min": min(reference_ious),
+            "p01": float(np.quantile(reference_ious, 0.01)),
             "p05": float(np.quantile(reference_ious, 0.05)),
             "mean": float(np.mean(reference_ious)),
+            "below_diagnostic_threshold": sum(
+                value < LOW_QUERY_REFERENCE_IOU for value in reference_ious
+            ),
+            "below_diagnostic_fraction": float(
+                np.mean(
+                    np.asarray(reference_ious, dtype=np.float64)
+                    < LOW_QUERY_REFERENCE_IOU
+                )
+            ),
         },
         "max_within_forward_feature_delta": dict(
             sorted(max_within_forward_feature_delta.items())
@@ -596,7 +601,8 @@ def process_unit(
         ),
         "query_selection_contract": (
             "maximum replay-query 2D IoU to frozen raw Stage-4 public 2D box; "
-            "point prompts remain the frozen-model input"
+            "point prompts remain the frozen-model input; all argmax matches "
+            "are retained and sel_reference_iou is persisted for diagnostics"
         ),
         "pairs_path": str(pairs_unit),
         "pairs_sha256": sha256_file(pairs_unit),

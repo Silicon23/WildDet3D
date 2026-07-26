@@ -123,13 +123,16 @@ def validate_cache_completion(
         )
     cached_rows = 0
     cached_tracks = 0
+    query_iou_min = 1.0
+    query_iou_weighted_sum = 0.0
+    query_iou_below_threshold = 0
     trajectory_paths: set[str] = set()
     for key, marker_path in observed.items():
         with marker_path.open() as handle:
             marker = json.load(handle)
         if (
             marker.get("status") != "done"
-            or marker.get("schema_version") != "v2_track_c_cache_v3"
+            or marker.get("schema_version") != "v2_track_c_cache_v4"
         ):
             raise ValueError(f"non-done marker {marker_path}")
         if (
@@ -159,6 +162,19 @@ def validate_cache_completion(
             raise ValueError(f"track count mismatch in {marker_path}")
         if not Path(marker["frame_cache_path"]).is_file():
             raise FileNotFoundError(marker["frame_cache_path"])
+        query_iou = marker.get("query_reference_iou", {})
+        if (
+            query_iou.get("selection") != "argmax_no_gate"
+            or float(query_iou.get("diagnostic_low_threshold", -1)) != 0.5
+        ):
+            raise ValueError(
+                f"query correspondence contract mismatch in {marker_path}"
+            )
+        query_iou_min = min(query_iou_min, float(query_iou["min"]))
+        query_iou_weighted_sum += float(query_iou["mean"]) * int(marker["pairs"])
+        query_iou_below_threshold += int(
+            query_iou["below_diagnostic_threshold"]
+        )
     actual_trajectories = {
         str(path.resolve()) for path in (cache_root / "traj").glob("*.pt")
     }
@@ -179,6 +195,16 @@ def validate_cache_completion(
         "variants": ["point_v3", "point_vlm_v1"],
         "track_c_post_pair_filtering": "none",
         "ca1m_upstream_suitability_filter": "already_applied",
+        "query_correspondence": {
+            "selection": "argmax_no_gate",
+            "diagnostic_low_threshold": 0.5,
+            "min": query_iou_min,
+            "mean": query_iou_weighted_sum / cached_rows,
+            "below_diagnostic_threshold": query_iou_below_threshold,
+            "below_diagnostic_fraction": (
+                query_iou_below_threshold / cached_rows
+            ),
+        },
     }
 
 

@@ -188,7 +188,7 @@ class V2CachedTrackDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         trajectory = self.records[index]
         frame_cache = self.frame_store.get(trajectory["video_key"])
-        if trajectory.get("schema_version") != "v2_track_c_cache_v3":
+        if trajectory.get("schema_version") != "v2_track_c_cache_v4":
             raise ValueError(
                 f"unsupported trajectory cache schema in "
                 f"{trajectory['video_key']}: {trajectory.get('schema_version')}"
@@ -221,6 +221,7 @@ class V2CachedTrackDataset(Dataset):
             "category": trajectory["category"],
             "source_frame_index": trajectory["source_frame_index"].long(),
             "iou3d_input": trajectory["iou3d_input"].float(),
+            "sel_reference_iou": trajectory["sel_reference_iou"].float(),
         }
 
 
@@ -364,6 +365,9 @@ def collate_v2_trajectories(packs: list[dict[str, Any]]) -> dict[str, Any]:
         "gt_dims": torch.cat([pack["gt_dims"] for pack in packs], dim=0),
         "gt_quat": torch.cat([pack["gt_quat"] for pack in packs], dim=0),
         "iou3d_input": torch.cat([pack["iou3d_input"] for pack in packs], dim=0),
+        "sel_reference_iou": torch.cat(
+            [pack["sel_reference_iou"] for pack in packs], dim=0
+        ),
         "prompt_variant_id": variant_ids,
         "prompt_variant_id_per_frame": variant_ids_per_frame,
         "datasets": [pack["dataset"] for pack in packs],
