@@ -170,6 +170,7 @@ RAW_REPLAY_TOLERANCES = {
     "score_2d": 2e-3,
     "score_3d": 2e-3,
 }
+MIN_QUERY_REFERENCE_IOU = 0.5
 
 
 def _trajectory_filename(prefix: str, track_id: str) -> str:
@@ -315,6 +316,7 @@ def process_unit(
     frame_cache: dict[int, dict[str, Any]] = {}
     prompt_features: dict[tuple[str, int], dict[str, Any]] = {}
     max_qa = collections.defaultdict(float)
+    reference_ious: list[float] = []
     raw_replay_within_tolerance = 0
     n_forwards = 0
     replay_context_prompts = 0
@@ -343,12 +345,14 @@ def process_unit(
                 for _, raw in chunk
             ]
             labels = [str(raw["text_prompt"]) for _, raw in chunk]
+            reference_boxes = [raw["box_2d_xyxy"] for _, raw in chunk]
             features = extractor.extract(
                 image=image,
                 intrinsics=K,
                 points_xy_label=points,
                 label=labels,
                 depth_m=depth_m,
+                reference_boxes_xyxy=reference_boxes,
                 amp_dtype=amp_dtype,
             )
             n_forwards += 1
@@ -435,6 +439,14 @@ def process_unit(
                     )
                 )
                 key = (str(pair["track_id"]), int(pair["frame_index"]))
+                reference_iou = float(features["sel_reference_iou"][i])
+                if reference_iou < MIN_QUERY_REFERENCE_IOU:
+                    raise RuntimeError(
+                        "no replay decoder query corresponds to the raw "
+                        f"Stage-4 2D box: unit={unit} key={key} "
+                        f"best_iou={reference_iou}"
+                    )
+                reference_ious.append(reference_iou)
                 prompt_features[key] = {
                     "hidden": features["hidden_states"][:, i, :],
                     "box2d": features["pred_box_2d"][i],
@@ -442,6 +454,7 @@ def process_unit(
                     "sel_n_positive_inside": features[
                         "sel_n_positive_inside"
                     ][i],
+                    "sel_reference_iou": features["sel_reference_iou"][i],
                     "vggt_frame_index": vggt_index,
                     "feature_slot": feature_slot,
                 }
@@ -484,7 +497,7 @@ def process_unit(
             timestamp_source = "source_timestamp_ns"
 
         trajectory = {
-            "schema_version": "v2_track_c_cache_v2",
+            "schema_version": "v2_track_c_cache_v3",
             "prompt_variant": variant,
             "prompt_variant_id": VARIANT_TO_ID[variant],
             "dataset": dataset,
@@ -522,6 +535,9 @@ def process_unit(
             "sel_n_positive_inside": torch.stack(
                 [prompt_features[key]["sel_n_positive_inside"] for key in keys]
             ).long(),
+            "sel_reference_iou": torch.stack(
+                [prompt_features[key]["sel_reference_iou"] for key in keys]
+            ).float(),
             "box_repr": torch.stack([_box_repr(row) for row in track_rows]),
             "gt_center": torch.tensor(
                 [row["gt_center_cam"] for row in track_rows], dtype=torch.float32
@@ -542,7 +558,7 @@ def process_unit(
         trajectory_paths.append(str(traj_path))
 
     result = {
-        "schema_version": "v2_track_c_cache_v2",
+        "schema_version": "v2_track_c_cache_v3",
         "status": "done",
         "prompt_variant": variant,
         "prompt_variant_id": VARIANT_TO_ID[variant],
@@ -559,6 +575,12 @@ def process_unit(
         "raw_replay_within_tolerance": raw_replay_within_tolerance,
         "raw_replay_total": len(pairs),
         "raw_replay_tolerances": RAW_REPLAY_TOLERANCES,
+        "query_reference_iou": {
+            "required_min": MIN_QUERY_REFERENCE_IOU,
+            "min": min(reference_ious),
+            "p05": float(np.quantile(reference_ious, 0.05)),
+            "mean": float(np.mean(reference_ious)),
+        },
         "max_within_forward_feature_delta": dict(
             sorted(max_within_forward_feature_delta.items())
         ),
@@ -571,6 +593,10 @@ def process_unit(
             "all raw frame prompts in canonical shared-image multi-label chunks; "
             "raw Stage-4 box is the temporal prior; replay hidden/depth/2D box "
             "is the self-consistent visual observation"
+        ),
+        "query_selection_contract": (
+            "maximum replay-query 2D IoU to frozen raw Stage-4 public 2D box; "
+            "point prompts remain the frozen-model input"
         ),
         "pairs_path": str(pairs_unit),
         "pairs_sha256": sha256_file(pairs_unit),

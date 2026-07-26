@@ -1,18 +1,18 @@
 """Canonical frozen-feature replay for v2 positive-point WildDet3D tracks.
 
-Unlike the original Track C cache (GT-box prompts), v2 replays the
+Unlike the original Track C cache (GT-box prompts), v2 canonically replays the
 point-prompted Stage-4 frozen stack with:
 
-* one repeated image per positive-point prompt,
-* shared category-conditioned ``prompt_text="geometric: <label>"``,
+* one shared image for all prompts in a frame,
+* per-prompt category-conditioned ``prompt_text="geometric: <label>"``,
 * metric VGGT depth and saved-frame intrinsics,
-* Stage-4 score/NMS followed by point-containment proposal routing.
+* raw Stage-4 public 2D boxes as decoder-query correspondence references.
 
-The selected decoder query is recovered from the raw model tensors by
-replaying that routing. The final public prediction is returned for measuring
-replay drift against the frozen v2 record. Bitwise reproduction is not assumed:
-the production corpus spans GPU architectures and did not persist OOM-adjusted
-batch sizes or deterministic-kernel state.
+Point prompts remain the frozen model input, while the selected decoder query is
+the replay query with maximum 2D IoU to the raw public prediction. The raw 3D
+box remains the temporal prior. Bitwise reproduction is not assumed: the
+production corpus spans GPU architectures and did not persist OOM-adjusted batch
+sizes or deterministic-kernel state.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from torchvision.ops import batched_nms
 
 from wilddet3d.data_types import Det3DOut, WildDet3DInput
 from wilddet3d.inference import (
+    _orig_to_input_hw_box,
     _orig_to_input_hw_point,
     build_model,
 )
@@ -192,6 +193,67 @@ def _select_raw_queries(
     return torch.stack(selected), torch.tensor(selected_n_inside, dtype=torch.long)
 
 
+def _select_reference_queries(
+    captured: dict[str, Tensor],
+    reference_boxes_model_xyxy: Sequence[Sequence[float]],
+    input_hw: tuple[int, int],
+) -> tuple[Tensor, Tensor]:
+    """Select the replay query closest to each frozen Stage-4 public 2D box."""
+    height, width = input_hw
+    boxes_px = captured["pred_boxes_2d"].clone()
+    boxes_px[..., 0::2] *= width
+    boxes_px[..., 1::2] *= height
+    selected = []
+    selected_iou = []
+    for prompt_index, reference in enumerate(reference_boxes_model_xyxy):
+        ref = torch.as_tensor(
+            reference, dtype=boxes_px.dtype, device=boxes_px.device
+        )
+        candidate = boxes_px[prompt_index]
+        lt = torch.maximum(candidate[:, :2], ref[:2])
+        rb = torch.minimum(candidate[:, 2:], ref[2:])
+        wh = (rb - lt).clamp(min=0)
+        intersection = wh[:, 0] * wh[:, 1]
+        candidate_wh = (candidate[:, 2:] - candidate[:, :2]).clamp(min=0)
+        candidate_area = candidate_wh[:, 0] * candidate_wh[:, 1]
+        ref_wh = (ref[2:] - ref[:2]).clamp(min=0)
+        ref_area = ref_wh[0] * ref_wh[1]
+        iou = intersection / (candidate_area + ref_area - intersection).clamp(
+            min=1e-8
+        )
+        index = iou.argmax()
+        selected.append(index)
+        selected_iou.append(iou[index])
+    return torch.stack(selected), torch.stack(selected_iou)
+
+
+def _positive_inside_for_selected(
+    captured: dict[str, Tensor],
+    selected: Tensor,
+    points_model: Sequence[Sequence[tuple[float, float, int]]],
+    input_hw: tuple[int, int],
+) -> Tensor:
+    height, width = input_hw
+    boxes_px = captured["pred_boxes_2d"].clone()
+    boxes_px[..., 0::2] *= width
+    boxes_px[..., 1::2] *= height
+    counts = []
+    for prompt_index, points in enumerate(points_model):
+        box = boxes_px[prompt_index, selected[prompt_index]]
+        count = sum(
+            int(
+                int(label) == 1
+                and float(x) >= float(box[0])
+                and float(x) <= float(box[2])
+                and float(y) >= float(box[1])
+                and float(y) <= float(box[3])
+            )
+            for x, y, label in points
+        )
+        counts.append(count)
+    return torch.tensor(counts, dtype=torch.long)
+
+
 class V2PointFeatureExtractor:
     """Frozen WildDet3D wrapper that exposes selected-query features."""
 
@@ -239,6 +301,7 @@ class V2PointFeatureExtractor:
         points_xy_label: Sequence[Sequence[tuple[float, float, int]]],
         label: str | Sequence[str],
         depth_m: np.ndarray,
+        reference_boxes_xyxy: Sequence[Sequence[float]] | None = None,
         amp_dtype: str = "bf16",
     ) -> dict:
         """Run a canonical v2 point-prompt group and return CPU cache tensors."""
@@ -251,6 +314,10 @@ class V2PointFeatureExtractor:
         )
         if len(labels) != len(points_xy_label) or any(not value for value in labels):
             raise ValueError("one nonempty text label is required per prompt")
+        if reference_boxes_xyxy is not None and len(reference_boxes_xyxy) != len(
+            points_xy_label
+        ):
+            raise ValueError("one reference 2D box is required per prompt")
         image = np.asarray(image).astype(np.float32)
         intrinsics = np.asarray(intrinsics).astype(np.float32)
         depth_m = np.asarray(depth_m).astype(np.float32)
@@ -385,9 +452,27 @@ class V2PointFeatureExtractor:
             self.wd._forward_test = original_forward_test
             hook.remove()
 
-        selected, n_inside = _select_raw_queries(
-            self.wd, captured, points_model, (height, width)
-        )
+        reference_iou = None
+        if reference_boxes_xyxy is None:
+            selected, n_inside = _select_raw_queries(
+                self.wd, captured, points_model, (height, width)
+            )
+        else:
+            reference_boxes_model = [
+                _orig_to_input_hw_box(
+                    list(box),
+                    data["original_hw"],
+                    data["padding"],
+                    (height, width),
+                )
+                for box in reference_boxes_xyxy
+            ]
+            selected, reference_iou = _select_reference_queries(
+                captured, reference_boxes_model, (height, width)
+            )
+            n_inside = _positive_inside_for_selected(
+                captured, selected, points_model, (height, width)
+            )
         hidden = captured["hidden_states"]
         if hidden.ndim != 4 or hidden.shape[1] != n_prompts:
             raise RuntimeError(
@@ -458,6 +543,11 @@ class V2PointFeatureExtractor:
             "pred_box_2d": pred_box_norm.detach().float().cpu(),
             "sel_idx": selected.detach().cpu(),
             "sel_n_positive_inside": n_inside,
+            "sel_reference_iou": (
+                reference_iou.detach().float().cpu()
+                if reference_iou is not None
+                else None
+            ),
             # Keep the prompt batch dimension here. Cache production verifies
             # that repeated-image features agree within this one forward before
             # deduplicating them at the forward-chunk level.

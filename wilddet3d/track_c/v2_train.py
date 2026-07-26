@@ -129,7 +129,7 @@ def validate_cache_completion(
             marker = json.load(handle)
         if (
             marker.get("status") != "done"
-            or marker.get("schema_version") != "v2_track_c_cache_v2"
+            or marker.get("schema_version") != "v2_track_c_cache_v3"
         ):
             raise ValueError(f"non-done marker {marker_path}")
         if (

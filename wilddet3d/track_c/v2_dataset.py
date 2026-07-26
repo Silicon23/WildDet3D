@@ -188,7 +188,7 @@ class V2CachedTrackDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         trajectory = self.records[index]
         frame_cache = self.frame_store.get(trajectory["video_key"])
-        if trajectory.get("schema_version") != "v2_track_c_cache_v2":
+        if trajectory.get("schema_version") != "v2_track_c_cache_v3":
             raise ValueError(
                 f"unsupported trajectory cache schema in "
                 f"{trajectory['video_key']}: {trajectory.get('schema_version')}"

@@ -2,6 +2,7 @@ import math
 
 import torch
 
+from wilddet3d.track_c.v2_feature_extractor import _select_reference_queries
 from wilddet3d.track_c.v2_train import (
     EXPECTED_VARIANTS,
     learning_rate_scale,
@@ -92,6 +93,35 @@ def test_v2_decode_uses_each_frames_intrinsics():
     )
     torch.testing.assert_close(vectorized, loop)
     assert not torch.allclose(vectorized[0, :3], vectorized[1, :3])
+
+
+def test_reference_query_selection_uses_raw_public_box_correspondence():
+    captured = {
+        "pred_boxes_2d": torch.tensor(
+            [
+                [
+                    [0.05, 0.10, 0.25, 0.40],
+                    [0.40, 0.20, 0.80, 0.70],
+                    [0.60, 0.50, 0.95, 0.90],
+                ],
+                [
+                    [0.10, 0.10, 0.30, 0.30],
+                    [0.45, 0.45, 0.70, 0.75],
+                    [0.72, 0.10, 0.92, 0.35],
+                ],
+            ]
+        )
+    }
+    selected, iou = _select_reference_queries(
+        captured,
+        reference_boxes_model_xyxy=[
+            [82.0, 21.0, 158.0, 69.0],
+            [144.0, 10.0, 184.0, 35.0],
+        ],
+        input_hw=(100, 200),
+    )
+    torch.testing.assert_close(selected, torch.tensor([1, 2]))
+    assert torch.all(iou > 0.90)
 
 
 def test_weighted_sampler_covers_large_source_across_epoch_horizon():
