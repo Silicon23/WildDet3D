@@ -57,9 +57,17 @@ def test_waymo_pedestrians_are_eval_only_without_mutating_records():
     assert partition.report["authoritative_data_mutation"] == "none"
     assert partition.report["checkpoint_selection_slice"] == "primary_val"
     assert partition.report["heldout_eval_slices"]["waymo_pedestrian"] == {
-        "tracks": 2,
-        "frames": 6,
-        "scenes": 2,
+        "all": {"tracks": 2, "frames": 6, "scenes": 2},
+        "from_base_train_scenes": {
+            "tracks": 1,
+            "frames": 3,
+            "scenes": 1,
+        },
+        "from_base_val_scenes": {
+            "tracks": 1,
+            "frames": 3,
+            "scenes": 1,
+        },
     }
     assert all("training_disposition" not in record for record in records)
     annotations = {

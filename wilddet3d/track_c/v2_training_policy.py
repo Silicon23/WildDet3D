@@ -193,7 +193,23 @@ def partition_training_policy(
         "train_after_policy": _summarize(train_records),
         "primary_val_after_policy": _summarize(primary_val_records),
         "heldout_eval_slices": {
-            name: _summarize(records)
+            name: {
+                "all": _summarize(records),
+                "from_base_train_scenes": _summarize(
+                    [
+                        record
+                        for record in records
+                        if _record_key(record) in train_keys
+                    ]
+                ),
+                "from_base_val_scenes": _summarize(
+                    [
+                        record
+                        for record in records
+                        if _record_key(record) in val_keys
+                    ]
+                ),
+            }
             for name, records in sorted(heldout_eval_slices.items())
         },
         "scene_overlap_note": (
