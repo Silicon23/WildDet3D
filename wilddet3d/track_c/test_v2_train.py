@@ -62,6 +62,11 @@ def test_warmup_cosine_schedule_bounds():
     assert all(0.0 <= value <= 1.0 for value in values)
 
 
+def test_cudnn_sdpa_is_disabled_for_blackwell_training():
+    if torch.cuda.is_available():
+        assert not torch.backends.cuda.cudnn_sdp_enabled()
+
+
 def test_v2_decode_uses_each_frames_intrinsics():
     model = V2TrackCRefiner(
         reg_residual_from_prior=False,

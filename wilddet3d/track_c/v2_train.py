@@ -28,6 +28,12 @@ import torch
 from torch import Tensor
 from vis4d.op.geometry.rotation import matrix_to_quaternion, quaternion_to_matrix
 
+# cuDNN SDPA cannot build an execution plan for some Transformer attention
+# shapes on Blackwell (sm_103). Keep flash, memory-efficient, and math SDPA
+# available while excluding only the failing cuDNN backend.
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_cudnn_sdp(False)
+
 from wilddet3d.ops.iou_3d_safe import batch_box3d_iou
 from wilddet3d.ops.rotation import rotation_6d_to_matrix
 from wilddet3d.track_c.losses import encode_targets_batched
