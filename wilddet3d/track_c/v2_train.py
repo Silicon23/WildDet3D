@@ -17,6 +17,7 @@ import json
 import math
 import os
 import random
+import signal
 import tempfile
 import time
 from collections import defaultdict
@@ -63,6 +64,98 @@ AUTHORITATIVE_COMBINED = {
     "point_v3": "pairs.jsonl",
     "point_vlm_v1": "pairs_vlm_v1.jsonl",
 }
+RESUME_SCHEMA_VERSION = "v2_track_c_resume_v2"
+RESUME_COMPATIBILITY_KEYS = (
+    "epochs",
+    "batch_trajs",
+    "max_frames_per_batch",
+    "lr",
+    "temporal_lr_mult",
+    "variant_lr_mult",
+    "mask_frame_p",
+    "warmup_steps",
+    "val_fraction",
+    "seed",
+)
+
+
+class PreemptionHandler:
+    """Defer termination until the current optimizer step is checkpointed."""
+
+    def __init__(self) -> None:
+        self.signal_number: int | None = None
+        self._previous_handlers: dict[int, Any] = {}
+
+    @property
+    def requested(self) -> bool:
+        return self.signal_number is not None
+
+    def _handle(self, signal_number: int, _frame: Any) -> None:
+        if self.signal_number is None:
+            self.signal_number = signal_number
+
+    def install(self) -> None:
+        for signal_number in (signal.SIGTERM, signal.SIGINT):
+            self._previous_handlers[signal_number] = signal.getsignal(signal_number)
+            signal.signal(signal_number, self._handle)
+
+    def terminate(self) -> None:
+        """Restore default handling and preserve the scheduler's signal exit."""
+        if self.signal_number is None:
+            return
+        signal_number = self.signal_number
+        signal.signal(signal_number, signal.SIG_DFL)
+        os.kill(os.getpid(), signal_number)
+        raise SystemExit(128 + signal_number)
+
+
+def capture_rng_state(device: str) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if device.startswith("cuda") and torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: dict[str, Any], device: str) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if (
+        device.startswith("cuda")
+        and torch.cuda.is_available()
+        and "torch_cuda" in state
+    ):
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def groups_sha256(groups: Iterable[Iterable[int]]) -> str:
+    digest = hashlib.sha256()
+    for group in groups:
+        digest.update(b"[")
+        for index in group:
+            digest.update(str(int(index)).encode("ascii"))
+            digest.update(b",")
+        digest.update(b"]")
+    return digest.hexdigest()
+
+
+def validate_resume_compatibility(
+    saved_args: dict[str, Any], current_args: argparse.Namespace
+) -> None:
+    mismatches = {
+        key: (saved_args.get(key), getattr(current_args, key))
+        for key in RESUME_COMPATIBILITY_KEYS
+        if saved_args.get(key) != getattr(current_args, key)
+    }
+    if mismatches:
+        raise ValueError(
+            "resume checkpoint training arguments changed: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
 
 
 def validate_cache_completion(
@@ -577,6 +670,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--preload_frames", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--auto_resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--checkpoint_every_steps",
+        type=int,
+        default=250,
+        help="atomic mid-epoch checkpoint interval; 0 disables the step trigger",
+    )
+    parser.add_argument(
+        "--checkpoint_every_seconds",
+        type=float,
+        default=1800.0,
+        help="atomic mid-epoch checkpoint interval; 0 disables the time trigger",
+    )
     parser.add_argument("--max_epochs_this_run", type=int)
     return parser.parse_args()
 
@@ -591,6 +696,8 @@ def main() -> None:
         return
     if not (0 <= args.mask_frame_p < 1):
         raise ValueError("--mask_frame_p must be in [0,1)")
+    if args.checkpoint_every_steps < 0 or args.checkpoint_every_seconds < 0:
+        raise ValueError("checkpoint intervals must be non-negative")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -699,6 +806,9 @@ def main() -> None:
     )
 
     start_epoch = 0
+    start_group_index = 0
+    resumed_epoch_state: dict[str, Any] | None = None
+    resumed_groups_sha256: str | None = None
     global_step = 0
     best_iou = -float("inf")
     history: list[dict[str, Any]] = []
@@ -708,13 +818,24 @@ def main() -> None:
         refiner.load_state_dict(resume["refiner"], strict=True)
         optimizer.load_state_dict(resume["optimizer"])
         scheduler.load_state_dict(resume["scheduler"])
-        start_epoch = int(resume["epoch"]) + 1
         global_step = int(resume["global_step"])
         best_iou = float(resume["best_iou"])
         history = list(resume["history"])
+        if resume.get("schema_version") == RESUME_SCHEMA_VERSION:
+            validate_resume_compatibility(resume["args"], args)
+            start_epoch = int(resume["epoch"])
+            start_group_index = int(resume["next_group_index"])
+            resumed_epoch_state = dict(resume["epoch_state"])
+            resumed_groups_sha256 = resume.get("groups_sha256")
+            restore_rng_state(resume["rng_state"], args.device)
+        else:
+            # Backward-compatible with the original epoch-boundary checkpoint.
+            start_epoch = int(resume["epoch"]) + 1
         print(
-            f"[resume] epoch={start_epoch}/{args.epochs} step={global_step} "
-            f"best_iou={best_iou:.4f}",
+            f"[resume] epoch={start_epoch}/{args.epochs} "
+            f"next_group={start_group_index} step={global_step} "
+            f"best_iou={best_iou:.4f} schema="
+            f"{resume.get('schema_version', 'legacy_epoch_boundary')}",
             flush=True,
         )
     else:
@@ -736,6 +857,46 @@ def main() -> None:
     stop_epoch = args.epochs
     if args.max_epochs_this_run is not None:
         stop_epoch = min(stop_epoch, start_epoch + args.max_epochs_this_run)
+    preemption = PreemptionHandler()
+    preemption.install()
+    last_checkpoint_monotonic = time.monotonic()
+
+    def save_resume(
+        *,
+        epoch: int,
+        next_group_index: int,
+        epoch_state: dict[str, Any],
+        group_digest: str | None,
+        reason: str,
+    ) -> None:
+        nonlocal last_checkpoint_monotonic
+        atomic_torch_save(
+            resume_path,
+            {
+                "schema_version": RESUME_SCHEMA_VERSION,
+                "refiner": refiner.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": epoch,
+                "next_group_index": next_group_index,
+                "epoch_state": epoch_state,
+                "groups_sha256": group_digest,
+                "global_step": global_step,
+                "best_iou": best_iou,
+                "history": history,
+                "rng_state": capture_rng_state(args.device),
+                "args": vars(args),
+                "checkpoint_reason": reason,
+                "saved_unix_time": time.time(),
+            },
+        )
+        last_checkpoint_monotonic = time.monotonic()
+        print(
+            f"[checkpoint] reason={reason} epoch={epoch} "
+            f"next_group={next_group_index} global_step={global_step}",
+            flush=True,
+        )
+
     for epoch in range(start_epoch, stop_epoch):
         refiner.train()
         sampler.set_epoch(epoch)
@@ -745,12 +906,48 @@ def main() -> None:
             args.batch_trajs,
             args.max_frames_per_batch,
         )
+        group_digest = groups_sha256(groups)
+        if epoch == start_epoch and resumed_groups_sha256 is not None:
+            if resumed_groups_sha256 != group_digest:
+                raise ValueError(
+                    "resume checkpoint group ordering changed: "
+                    f"{resumed_groups_sha256} != {group_digest}"
+                )
+        next_group_index = start_group_index if epoch == start_epoch else 0
+        if not (0 <= next_group_index <= len(groups)):
+            raise ValueError(
+                f"invalid resume group {next_group_index}/{len(groups)}"
+            )
         epoch_started = time.time()
-        loss_sum = 0.0
-        succeeded_steps = 0
-        skipped_steps = 0
-        last_loss: dict[str, Tensor] | None = None
-        for step_index, group in enumerate(groups):
+        if epoch == start_epoch and resumed_epoch_state is not None:
+            loss_sum = float(resumed_epoch_state["loss_sum"])
+            succeeded_steps = int(resumed_epoch_state["succeeded_steps"])
+            skipped_steps = int(resumed_epoch_state["skipped_steps"])
+            elapsed_before_resume = float(
+                resumed_epoch_state["elapsed_seconds"]
+            )
+            last_loss_values = resumed_epoch_state.get("last_loss")
+        else:
+            loss_sum = 0.0
+            succeeded_steps = 0
+            skipped_steps = 0
+            elapsed_before_resume = 0.0
+            last_loss_values = None
+
+        def epoch_state() -> dict[str, Any]:
+            return {
+                "loss_sum": loss_sum,
+                "succeeded_steps": succeeded_steps,
+                "skipped_steps": skipped_steps,
+                "elapsed_seconds": (
+                    elapsed_before_resume + time.time() - epoch_started
+                ),
+                "last_loss": last_loss_values,
+                "group_count": len(groups),
+            }
+
+        for step_index in range(next_group_index, len(groups)):
+            group = groups[step_index]
             packs = [train_dataset[index] for index in group]
             batch = to_device(collate_v2_trajectories(packs), args.device)
             frame_count = int(batch["hidden"].shape[1])
@@ -795,30 +992,66 @@ def main() -> None:
                     f"[skip] epoch={epoch} step={step_index} nonfinite_loss",
                     flush=True,
                 )
-                continue
-            total.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                refiner.parameters(), max_norm=5.0
-            )
-            if not bool(torch.isfinite(grad_norm)):
-                optimizer.zero_grad(set_to_none=True)
-                skipped_steps += 1
-                scheduler.step()
-                global_step += 1
-                print(
-                    f"[skip] epoch={epoch} step={step_index} nonfinite_grad",
-                    flush=True,
+            else:
+                total.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    refiner.parameters(), max_norm=5.0
                 )
-                continue
-            optimizer.step()
-            scheduler.step()
-            global_step += 1
-            succeeded_steps += 1
-            loss_sum += float(total)
-            last_loss = loss
+                if not bool(torch.isfinite(grad_norm)):
+                    optimizer.zero_grad(set_to_none=True)
+                    skipped_steps += 1
+                    scheduler.step()
+                    global_step += 1
+                    print(
+                        f"[skip] epoch={epoch} step={step_index} nonfinite_grad",
+                        flush=True,
+                    )
+                else:
+                    optimizer.step()
+                    scheduler.step()
+                    global_step += 1
+                    succeeded_steps += 1
+                    loss_sum += float(total.detach())
+                    last_loss_values = {
+                        name: float(loss[name].detach())
+                        for name in (
+                            "loss_center",
+                            "loss_depth",
+                            "loss_dims_encoded",
+                            "loss_rot_deg",
+                        )
+                    }
+            completed_groups = step_index + 1
+            checkpoint_by_step = (
+                args.checkpoint_every_steps > 0
+                and global_step % args.checkpoint_every_steps == 0
+            )
+            checkpoint_by_time = (
+                args.checkpoint_every_seconds > 0
+                and time.monotonic() - last_checkpoint_monotonic
+                >= args.checkpoint_every_seconds
+            )
+            if preemption.requested or checkpoint_by_step or checkpoint_by_time:
+                reason = (
+                    f"signal_{preemption.signal_number}"
+                    if preemption.requested
+                    else "periodic"
+                )
+                save_resume(
+                    epoch=epoch,
+                    next_group_index=completed_groups,
+                    epoch_state=epoch_state(),
+                    group_digest=group_digest,
+                    reason=reason,
+                )
+                if preemption.requested:
+                    preemption.terminate()
             if (step_index + 1) % 100 == 0 or step_index + 1 == len(groups):
-                elapsed = max(time.time() - epoch_started, 1e-6)
-                rate = (step_index + 1) / elapsed
+                elapsed = max(
+                    elapsed_before_resume + time.time() - epoch_started, 1e-6
+                )
+                completed = succeeded_steps + skipped_steps
+                rate = completed / elapsed
                 eta = (len(groups) - step_index - 1) / max(rate, 1e-9)
                 print(
                     f"[epoch {epoch}] steps={step_index + 1}/{len(groups)} "
@@ -827,7 +1060,18 @@ def main() -> None:
                     f"ETA={eta / 60:.1f}m",
                     flush=True,
                 )
-        if last_loss is None:
+        # Protect the complete epoch before potentially long validation. A
+        # preemption during validation will rerun validation, never training.
+        save_resume(
+            epoch=epoch,
+            next_group_index=len(groups),
+            epoch_state=epoch_state(),
+            group_digest=group_digest,
+            reason="pre_eval",
+        )
+        if preemption.requested:
+            preemption.terminate()
+        if last_loss_values is None:
             raise RuntimeError(f"epoch {epoch} had no finite optimizer steps")
         record: dict[str, Any] = {
             "epoch": epoch,
@@ -835,12 +1079,11 @@ def main() -> None:
             "train_loss": loss_sum / max(succeeded_steps, 1),
             "succeeded_steps": succeeded_steps,
             "skipped_steps": skipped_steps,
-            "epoch_seconds": time.time() - epoch_started,
+            "epoch_seconds": (
+                elapsed_before_resume + time.time() - epoch_started
+            ),
             "lr": [group["lr"] for group in optimizer.param_groups],
-            "loss_center": float(last_loss["loss_center"]),
-            "loss_depth": float(last_loss["loss_depth"]),
-            "loss_dims_encoded": float(last_loss["loss_dims_encoded"]),
-            "loss_rot_deg": float(last_loss["loss_rot_deg"]),
+            **last_loss_values,
         }
         if (epoch + 1) % args.eval_every == 0 or epoch + 1 == args.epochs:
             evaluation = evaluate(
@@ -876,19 +1119,25 @@ def main() -> None:
                 )
         history.append(record)
         atomic_json(args.out_dir / "history.json", history)
-        atomic_torch_save(
-            resume_path,
-            {
-                "refiner": refiner.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "epoch": epoch,
-                "global_step": global_step,
-                "best_iou": best_iou,
-                "history": history,
-                "args": vars(args),
+        save_resume(
+            epoch=epoch + 1,
+            next_group_index=0,
+            epoch_state={
+                "loss_sum": 0.0,
+                "succeeded_steps": 0,
+                "skipped_steps": 0,
+                "elapsed_seconds": 0.0,
+                "last_loss": None,
+                "group_count": None,
             },
+            group_digest=None,
+            reason="epoch_complete",
         )
+        if preemption.requested:
+            preemption.terminate()
+        start_group_index = 0
+        resumed_epoch_state = None
+        resumed_groups_sha256 = None
 
     if stop_epoch == args.epochs:
         atomic_torch_save(

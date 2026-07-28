@@ -1,12 +1,20 @@
 import math
+import random
+from argparse import Namespace
 
+import numpy as np
 import torch
 
 from wilddet3d.track_c.v2_feature_extractor import _select_reference_queries
 from wilddet3d.track_c.v2_train import (
     EXPECTED_VARIANTS,
+    atomic_torch_save,
+    capture_rng_state,
+    groups_sha256,
     learning_rate_scale,
+    restore_rng_state,
     time_metrics,
+    validate_resume_compatibility,
     validate_universe,
 )
 from wilddet3d.track_c.v2_refiner import V2TrackCRefiner
@@ -157,3 +165,59 @@ def test_weighted_sampler_covers_large_source_across_epoch_horizon():
         == sum(record["dataset"] == source for record in dataset.records)
         for source in seen
     )
+
+
+def test_rng_state_round_trip_replays_next_training_randomness():
+    random.seed(17)
+    np.random.seed(17)
+    torch.manual_seed(17)
+    state = capture_rng_state("cpu")
+    expected = (
+        random.random(),
+        np.random.random(3),
+        torch.rand(3),
+    )
+    random.random()
+    np.random.random(9)
+    torch.rand(9)
+    restore_rng_state(state, "cpu")
+    assert random.random() == expected[0]
+    np.testing.assert_array_equal(np.random.random(3), expected[1])
+    torch.testing.assert_close(torch.rand(3), expected[2], rtol=0, atol=0)
+
+
+def test_atomic_checkpoint_and_group_digest_contract(tmp_path):
+    checkpoint = tmp_path / "resume.pt"
+    atomic_torch_save(checkpoint, {"step": 7, "tensor": torch.arange(4)})
+    loaded = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    assert loaded["step"] == 7
+    torch.testing.assert_close(loaded["tensor"], torch.arange(4))
+    assert not list(tmp_path.glob(".resume.pt.tmp.*"))
+
+    groups = [[5, 2], [9], [4, 1, 7]]
+    assert groups_sha256(groups) == groups_sha256([tuple(group) for group in groups])
+    assert groups_sha256(groups) != groups_sha256([[2, 5], [9], [4, 1, 7]])
+
+
+def test_resume_compatibility_rejects_training_semantic_change():
+    current = Namespace(
+        epochs=12,
+        batch_trajs=4,
+        max_frames_per_batch=200,
+        lr=1e-4,
+        temporal_lr_mult=20.0,
+        variant_lr_mult=5.0,
+        mask_frame_p=0.05,
+        warmup_steps=500,
+        val_fraction=0.08,
+        seed=0,
+    )
+    saved = vars(current).copy()
+    validate_resume_compatibility(saved, current)
+    saved["batch_trajs"] = 8
+    try:
+        validate_resume_compatibility(saved, current)
+    except ValueError as error:
+        assert "batch_trajs" in str(error)
+    else:
+        raise AssertionError("incompatible resume arguments were accepted")
