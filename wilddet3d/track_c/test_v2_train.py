@@ -10,6 +10,7 @@ from wilddet3d.track_c.v2_train import (
     EXPECTED_VARIANTS,
     atomic_torch_save,
     capture_rng_state,
+    enable_parent_death_signal,
     groups_sha256,
     learning_rate_scale,
     restore_rng_state,
@@ -221,3 +222,17 @@ def test_resume_compatibility_rejects_training_semantic_change():
         assert "batch_trajs" in str(error)
     else:
         raise AssertionError("incompatible resume arguments were accepted")
+
+
+def test_parent_death_signal_registers_sigterm(monkeypatch):
+    calls = []
+
+    class LibC:
+        def prctl(self, *args):
+            calls.append(args)
+            return 0
+
+    monkeypatch.setattr("wilddet3d.track_c.v2_train.ctypes.CDLL", lambda *a, **k: LibC())
+    monkeypatch.setattr("wilddet3d.track_c.v2_train.os.getppid", lambda: 123)
+    enable_parent_death_signal()
+    assert calls == [(1, 15, 0, 0, 0)]

@@ -12,12 +12,14 @@ bidirectional trajectory encoder, xattn-only multi-token temporal context,
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import math
 import os
 import random
 import signal
+import sys
 import tempfile
 import time
 from collections import defaultdict
@@ -107,6 +109,21 @@ class PreemptionHandler:
         signal.signal(signal_number, signal.SIG_DFL)
         os.kill(os.getpid(), signal_number)
         raise SystemExit(128 + signal_number)
+
+
+def enable_parent_death_signal() -> None:
+    """Ask Linux to SIGTERM Python if its training wrapper disappears."""
+    if not sys.platform.startswith("linux"):
+        return
+    parent_pid = os.getppid()
+    libc = ctypes.CDLL(None, use_errno=True)
+    pr_set_pdeathsig = 1
+    if libc.prctl(pr_set_pdeathsig, signal.SIGTERM, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    # Close the race where the parent died immediately before prctl().
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGTERM)
 
 
 def capture_rng_state(device: str) -> dict[str, Any]:
@@ -859,6 +876,7 @@ def main() -> None:
         stop_epoch = min(stop_epoch, start_epoch + args.max_epochs_this_run)
     preemption = PreemptionHandler()
     preemption.install()
+    enable_parent_death_signal()
     last_checkpoint_monotonic = time.monotonic()
 
     def save_resume(
