@@ -24,13 +24,17 @@ ap.add_argument("--reg_residual_from_prior", type=int, default=0)
 ap.add_argument("--no_traj_encoder", type=int, default=0)
 ap.add_argument("--temporal_kv_norm", type=int, default=0)
 ap.add_argument("--temporal_multi_token", type=int, default=0)
+ap.add_argument("--temporal_block", default="prompt3d",
+                choices=("prompt3d", "xattn_only"),
+                help="'xattn_only' for WX3-era checkpoints")
 ap.add_argument("--use_layer_bias", type=int, default=0)
+ap.add_argument("--device", default="cuda", help="cpu fallback when GPU is incompatible")
 ap.add_argument("--val_split_file", default=None, help="Waymo/ADT split override; ''=RNG")
 ap.add_argument("--categories", default="", help="comma list to keep; needs --pairing_index")
 ap.add_argument("--pairing_index", default="")
 ap.add_argument("--extrinsics_note", default="frame_index indexes Step-1 arrays per video")
 a = ap.parse_args()
-dev = "cuda"
+dev = a.device
 
 paths = list_cached_trajectories(a.cache_dir)
 if a.categories and a.pairing_index:
@@ -46,7 +50,8 @@ r = TrackCRefiner(reg_residual_from_prior=bool(a.reg_residual_from_prior),
                   use_temporal_modules=not bool(a.no_traj_encoder),
                   use_layer_bias=bool(a.use_layer_bias),
                   use_temporal_kv_norm=bool(a.temporal_kv_norm),
-                  temporal_multi_token=bool(a.temporal_multi_token)).to(dev)
+                  temporal_multi_token=bool(a.temporal_multi_token),
+                  temporal_block=a.temporal_block).to(dev)
 r.load_state_dict(torch.load(a.ckpt, map_location="cpu", weights_only=False)["refiner"], strict=True)
 r.eval()
 
