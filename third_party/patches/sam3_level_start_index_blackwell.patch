@@ -1,0 +1,13 @@
+diff --git a/sam3/model/encoder.py b/sam3/model/encoder.py
+index c40ad77..04dbd14 100644
+--- a/sam3/model/encoder.py
++++ b/sam3/model/encoder.py
+@@ -357,7 +357,7 @@ class TransformerEncoder(nn.Module):
+         level_start_index = torch.cat(
+             (
+                 spatial_shapes.new_zeros((1,)),
+-                spatial_shapes.prod(1).cumsum(0)[:-1],
++                (spatial_shapes[:, 0] * spatial_shapes[:, 1]).cumsum(0)[:-1],
+             )
+         )
+         if has_mask:
